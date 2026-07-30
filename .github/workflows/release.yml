@@ -47,12 +47,18 @@ jobs:
       # carries the ad-hoc one through the zip. Fail here rather than shipping a
       # bundle nobody can open.
       - name: Verify the unpacked bundle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           work=$(mktemp -d)
           ditto -x -k "${{ steps.dist.outputs.zip }}" "$work"
-          codesign --verify --strict "$work/LLMUsage.app"
-          lipo -archs "$work/LLMUsage.app/Contents/MacOS/LLMUsage" | grep -q x86_64
-          lipo -archs "$work/LLMUsage.app/Contents/MacOS/LLMUsage" | grep -q arm64
+          # The zip wraps the bundle in LLMUsage-<version>/ so Homebrew has a
+          # single top-level directory to descend into — verify through that
+          # prefix, not at the root (see the Makefile's STAGE).
+          app="$work/LLMUsage-$VERSION/LLMUsage.app"
+          codesign --verify --strict "$app"
+          lipo -archs "$app/Contents/MacOS/LLMUsage" | grep -q x86_64
+          lipo -archs "$app/Contents/MacOS/LLMUsage" | grep -q arm64
 
       - name: Publish the release
         env:
