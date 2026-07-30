@@ -277,13 +277,13 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
 
     private static func claudeVersion() -> String? {
         // "2.1.220 (Claude Code)" -> "2.1.220"
-        run(["claude", "--version"])?
+        run("claude", ["--version"])?
             .split(separator: " ").first.map(String.init)
     }
 
     /// `claude auth status --json` gives both the plan and the signed-in address.
     private static func authStatus() -> (plan: String?, account: String?) {
-        guard let json = run(["claude", "auth", "status", "--json"]),
+        guard let json = run("claude", ["auth", "status", "--json"]),
               let data = json.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return (nil, nil) }
@@ -295,10 +295,15 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         return (plan, account)
     }
 
-    private static func run(_ arguments: [String]) -> String? {
+    /// The tool is resolved rather than run through `env`: a bundle launched by launchd
+    /// gets only the system PATH, which is why plan and account read "—" there while a
+    /// terminal run filled them in (see `CLI`).
+    private static func run(_ tool: String, _ arguments: [String]) -> String? {
+        guard let executable = CLI.path(tool) else { return nil }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.environment = CLI.environment()
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice

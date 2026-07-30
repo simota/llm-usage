@@ -82,7 +82,14 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
     private var nextID = 1
     private var cachedAccount: String?
     private var lastGood: UsageSource?
+    private var stopping = false
     private let lock = NSLock()
+
+    /// A server we terminated on purpose is not a failure worth a red card.
+    private struct ServerExited: LocalizedError {
+        let status: Int32
+        var errorDescription: String? { "codex app-server exited (status \(status))" }
+    }
 
     private static let pollInterval: TimeInterval = 300
 
@@ -91,15 +98,36 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
     }
 
     func start() {
+        // Resolved rather than looked up through `env`: a bundle launched by launchd
+        // or Finder has only the system PATH, so `env codex` failed silently and left
+        // the card blank for every Homebrew install (see `CLI`).
+        guard let executable = CLI.path("codex") else {
+            // Metering Codex is optional, so this is a card that says what is missing,
+            // not an error (docs/design.md §6).
+            var source = UsageSource.placeholder(id: "codex", name: "Codex")
+            source.note = CLI.NotFound(tool: "codex").errorDescription
+            onUpdate(.success(source))
+            return
+        }
+
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["codex", "app-server"]
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = ["app-server"]
+        // An npm-installed `codex` is a script that has to find `node` itself.
+        proc.environment = CLI.environment()
 
         let inPipe = Pipe(), outPipe = Pipe()
         proc.standardInput = inPipe
         proc.standardOutput = outPipe
         // The binary prints a PATH-alias warning to stderr; stdout is the protocol.
         proc.standardError = FileHandle.nullDevice
+
+        // Without this the card just stays empty when the server dies on startup —
+        // the failure mode that hid the PATH problem in the first place.
+        proc.terminationHandler = { [weak self] finished in
+            guard let self, !self.isStopping() else { return }
+            self.onUpdate(.failure(ServerExited(status: finished.terminationStatus)))
+        }
 
         do {
             try proc.run()
@@ -134,8 +162,16 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
     }
 
     func stop() {
+        lock.lock()
+        stopping = true
+        lock.unlock()
         process?.terminate()
         process = nil
+    }
+
+    private func isStopping() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopping
     }
 
     // MARK: - Transport

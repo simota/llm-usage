@@ -11,7 +11,19 @@ agree.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **Codex never appeared in the Homebrew build.** launchd and Finder hand a
+  bundle `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so spawning `codex app-server`
+  through `env` found nothing and the card sat empty with no explanation — while
+  the same build worked from a terminal. Tools are now resolved against the usual
+  install prefixes, falling back to the login shell's PATH for anything a version
+  manager owns, and the child process inherits that PATH so an npm-installed CLI
+  can still find `node`. The same lookup feeds `claude`, whose plan and account
+  went missing for the same reason.
+- A `codex app-server` that exits now says so on the card rather than leaving it
+  blank, and a `codex` that is not installed at all reads "codex not found in
+  PATH" instead of nothing.
 
 ## [0.1.0] - 2026-07-30
 
