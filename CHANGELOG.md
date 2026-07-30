@@ -11,6 +11,10 @@ agree.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.2] - 2026-07-30
+
 ### Fixed
 
 - **"Rate limited" was a dead end on the Claude Code card.** The OAuth usage
@@ -88,6 +92,7 @@ The first release. Everything below is new.
 - No automated tests yet, and CI runs only on tags — nothing verifies a build on
   push or pull request.
 
-[Unreleased]: https://github.com/simota/llm-usage/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/simota/llm-usage/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/simota/llm-usage/releases/tag/v0.1.2
 [0.1.1]: https://github.com/simota/llm-usage/releases/tag/v0.1.1
 [0.1.0]: https://github.com/simota/llm-usage/releases/tag/v0.1.0
