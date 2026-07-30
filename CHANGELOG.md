@@ -11,7 +11,39 @@ agree.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **The Claude Code card could say "Not signed in" right next to a known plan
+  and account.** The Keychain read and the `claude auth status` call are two
+  independent sources, and only the first fed the note line: any failure to
+  read the Keychain item — item genuinely absent, access refused, or an
+  unrecognised JSON shape — collapsed into the same "not signed in" message,
+  even when `auth status` had just confirmed an account. On this machine the
+  cause was the release bundle's ad-hoc signature changing cdhash on every
+  rebuild, which invalidates the Keychain item's per-build access grant, so
+  every fresh build starts out denied until the user re-approves it at the
+  macOS prompt — the item was present and enumerable the whole time, not
+  missing. The two sources are reconciled first: if the Keychain ever claims
+  the item is absent while `auth status` reports an account, that combination
+  is treated as a denied read rather than a real sign-out, checked against a
+  fresh `auth status` call rather than a cached one so a genuine `claude
+  logout` afterward still reads correctly. Short of that contradiction, the
+  card distinguishes three failure modes on their own terms: absent stays
+  "Not signed in to Claude Code," a denied read names the OSStatus and points
+  at approving access (or unlocking the login keychain, when that's the
+  actual block), and an unrecognised credential shape says so instead of
+  pretending to be a sign-out. A failed `auth status` probe — the unresolved
+  binary and bare-PATH failure this app has hit before — no longer reads as a
+  sign-out either; only a probe that actually got an answer of "no account"
+  does.
+- The Claude provider's refresh now runs on the provider's own queue whichever
+  thread asks for it. The panel's Refresh calls it from the main thread while
+  the poll timer calls it from that queue, and the reconciliation above is the
+  first thing on the path to *write* shared state rather than only read it —
+  the same state the fetch completion already owned. It also gets the Keychain
+  read off the main thread: that call blocks until the access prompt is
+  answered, so a build the Keychain does not yet trust used to freeze the UI
+  thread for as long as the dialog went unanswered.
 
 ## [0.2.0] - 2026-07-31
 

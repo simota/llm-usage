@@ -80,6 +80,11 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     private var retryScheduled = false
     private let queue = DispatchQueue(label: "llm-usage.claude")
     private lazy var userAgent = "claude-code/\(Self.claudeVersion() ?? "0.0.0")"
+    /// Cached at launch, but no longer only-ever-read: the disagreement check in
+    /// `readCredential()` below re-queries and overwrites it, since a launch-time cache
+    /// can outlive a `claude logout` that happens afterward. It's only overwritten with an
+    /// `.answered` re-probe, though — an `.unreachable` one means the re-probe couldn't ask
+    /// at all, which says nothing about whether the user is still signed in.
     private lazy var identity = Self.authStatus()
 
     init(onUpdate: @escaping @Sendable (UsageSource) -> Void) {
@@ -95,15 +100,78 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         timer = t
     }
 
+    /// Hops onto the provider's queue rather than reading state on the caller's thread.
+    /// The panel's Refresh calls this on the main thread while the timer calls it on
+    /// `queue`, and both now *write* `identity` on the disagreement path below — as
+    /// `lastGood` and the retry counters were already written from the fetch completion.
+    /// One queue owns all of it.
+    ///
+    /// It also keeps the read off the main thread, which matters more than the race:
+    /// `SecItemCopyMatching` blocks until the user answers the access prompt, so a build
+    /// the Keychain has not been told to trust would otherwise freeze the UI thread for
+    /// as long as the dialog sits there unanswered. Observed with `make probe`, where the
+    /// same call held the process until the prompt was dealt with.
     func refresh() {
+        queue.async { [weak self] in self?.readCredential() }
+    }
+
+    private func readCredential() {
         switch Self.credential() {
         case .missing:
-            emitUnavailable(reason: "Not signed in to Claude Code")
+            // `authStatus()` runs `claude auth status` — a different process, unaffected by
+            // this process's Keychain ACL. If it found an account, the item cannot really be
+            // absent, so a "missing" read here is this process being denied in a way the
+            // Keychain reports as not-found rather than as an auth failure. But `identity` is
+            // a launch-time cache that never invalidates on its own, so it can still hold an
+            // account after the user runs `claude logout` — re-probe fresh here rather than
+            // trust the cache. Only an `.answered` re-probe replaces it: an `.unreachable`
+            // one (unresolved `claude` binary, a process that wouldn't spawn, unparsable
+            // output — the launchd-bare-PATH failure this app has hit before) means we
+            // couldn't ask at all, which is not evidence of a sign-out and must not blank a
+            // plan and account we already know are real.
+            if identity.account != nil {
+                let reprobe = Self.authStatus()
+                if case .answered = reprobe { identity = reprobe }
+            }
+            if identity.account != nil {
+                emitUnavailable(reason: Self.unreadableReason(errSecItemNotFound))
+            } else {
+                emitUnavailable(reason: "Not signed in to Claude Code")
+            }
         case .expired:
             // Not an error: Claude Code renews this the next time it runs.
             emitUnavailable(reason: "Token expired (launch Claude Code to renew)")
+        case .unreadable(let status):
+            emitUnavailable(reason: Self.unreadableReason(status))
+        case .malformed:
+            emitUnavailable(reason: "Credential format not recognised (Claude Code may have changed it)")
         case .token(let token):
             fetch(token: token)
+        }
+    }
+
+    /// The release bundle is ad-hoc signed, so every rebuild produces a new cdhash. The
+    /// Keychain item's ACL grants access by (path, cdhash), so a grant made for one build
+    /// does not carry over to the next — each new build is denied until the user approves
+    /// it again at the OS prompt. That denial surfaces as a Keychain OSStatus, not as a
+    /// missing item, which is what distinguishes this case from `.missing`.
+    ///
+    /// The card gets the short form: the note wraps at 320pt and the rebuild mechanics
+    /// above are not something the reader can act on. The status number stays because it
+    /// is the one thing that makes a report of this diagnosable. Not every denial can be
+    /// fixed by approving a prompt, so the wording has to match what actually happened:
+    /// `errSecInteractionNotAllowed` means there is no session to host a prompt in at all
+    /// (locked keychain, no UI), and the reconciliation path in `readCredential()` passes
+    /// `errSecItemNotFound` here, where there is nothing to approve or unlock — the item
+    /// just couldn't be read.
+    private static func unreadableReason(_ status: OSStatus) -> String {
+        switch status {
+        case errSecInteractionNotAllowed:
+            return "Keychain locked (unlock the login keychain) [\(status)]"
+        case errSecItemNotFound:
+            return "Keychain item unreadable [\(status)]"
+        default:
+            return "Keychain access refused (approve the macOS prompt) [\(status)]"
         }
     }
 
@@ -117,7 +185,15 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     private enum Credential {
         case token(String)
         case expired
+        /// No item by this service name exists in the Keychain.
         case missing
+        /// The item exists but this process was refused access to it (ACL denial, a locked
+        /// keychain, etc.) — distinct from `.missing` because the remedy is different: grant
+        /// access, not sign in.
+        case unreadable(OSStatus)
+        /// The item was read successfully but its JSON didn't have the shape this decoder
+        /// expects — a schema change on Claude Code's side, not an access problem.
+        case malformed
     }
 
     private static func credential() -> Credential {
@@ -128,12 +204,15 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess else {
+            return status == errSecItemNotFound ? .missing : .unreadable(status)
+        }
+        guard let data = item as? Data,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = root["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String, !token.isEmpty
-        else { return .missing }
+        else { return .malformed }
 
         // expiresAt is milliseconds since epoch.
         if let expiresAt = oauth["expiresAt"] as? Double,
@@ -354,18 +433,31 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
             .split(separator: " ").first.map(String.init)
     }
 
+    /// Distinguishes "asked Claude Code and got an answer" (which may be no account at all —
+    /// a real sign-out) from "couldn't ask" (unresolved `claude` binary, a process that
+    /// wouldn't spawn, output that wouldn't parse). Collapsing the two into one `nil` used to
+    /// make a failed probe indistinguishable from a confirmed sign-out; `readCredential()`
+    /// relies on telling them apart.
+    private enum AuthProbe {
+        case unreachable
+        case answered(plan: String?, account: String?)
+
+        var plan: String? { if case .answered(let plan, _) = self { return plan }; return nil }
+        var account: String? { if case .answered(_, let account) = self { return account }; return nil }
+    }
+
     /// `claude auth status --json` gives both the plan and the signed-in address.
-    private static func authStatus() -> (plan: String?, account: String?) {
+    private static func authStatus() -> AuthProbe {
         guard let json = run("claude", ["auth", "status", "--json"]),
               let data = json.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return (nil, nil) }
+        else { return .unreachable }
 
         let plan = (root["subscriptionType"] as? String).flatMap { type -> String? in
             type.isEmpty ? nil : type.prefix(1).uppercased() + type.dropFirst()
         }
         let account = (root["email"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        return (plan, account)
+        return .answered(plan: plan, account: account)
     }
 
     /// The tool is resolved rather than run through `env`: a bundle launched by launchd
