@@ -57,14 +57,27 @@ private struct OAuthUsage: Decodable {
 /// Claude Code login. So an expired token is surfaced as staleness and the
 /// keychain is re-read each cycle to pick up whatever Claude Code last wrote.
 final class ClaudeProvider: @unchecked Sendable, UsageProviding {
-    private static let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+    /// Overridable the same way AgyProvider takes its port: the throttle and retry
+    /// path is unreachable against the real endpoint on demand, and shipping it
+    /// unexercised is how "Rate limited" became a dead end in the first place.
+    private static let endpoint: URL = {
+        let fallback = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+        return ProcessInfo.processInfo.environment["LLM_USAGE_CLAUDE_ENDPOINT"]
+            .flatMap(URL.init(string:)) ?? fallback
+    }()
     private static let service = "Claude Code-credentials"
     /// Below ~180s the endpoint drops into an aggressively rate-limited bucket.
     private static let pollInterval: TimeInterval = 300
+    /// A throttle or a dead connection clears up on its own, so it deserves a
+    /// retry sooner than the next poll — but backing off matters: the 429 bucket
+    /// only widens if we keep knocking. Caps at the poll interval.
+    private static let retryDelays: [TimeInterval] = [30, 60, 120, 300]
 
     private let onUpdate: @Sendable (UsageSource) -> Void
     private var timer: DispatchSourceTimer?
     private var lastGood: UsageSource?
+    private var retryAttempt = 0
+    private var retryScheduled = false
     private let queue = DispatchQueue(label: "llm-usage.claude")
     private lazy var userAgent = "claude-code/\(Self.claudeVersion() ?? "0.0.0")"
     private lazy var identity = Self.authStatus()
@@ -142,23 +155,83 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
             guard let self else { return }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
-            guard status == 200, let data else {
-                self.emitUnavailable(reason: Self.reason(for: status))
-                return
+            // Onto the provider's own queue: the retry bookkeeping below and the
+            // timer that also calls `refresh()` must not interleave.
+            self.queue.async {
+                guard status == 200, let data else {
+                    self.handleFailure(status: status, response: response)
+                    return
+                }
+                let decoder = JSONDecoder()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                guard let usage = try? decoder.decode(OAuthUsage.self, from: data) else {
+                    self.emitUnavailable(reason: "Could not read the response")
+                    return
+                }
+                var source = Self.normalise(usage)
+                source.plan = self.identity.plan
+                source.account = self.identity.account
+                self.lastGood = source
+                self.retryAttempt = 0
+                self.onUpdate(source)
             }
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
-            guard let usage = try? decoder.decode(OAuthUsage.self, from: data) else {
-                self.emitUnavailable(reason: "Could not read the response")
-                return
-            }
-            var source = Self.normalise(usage)
-            source.plan = self.identity.plan
-            source.account = self.identity.account
-            self.lastGood = source
-            self.onUpdate(source)
         }.resume()
     }
+
+    /// A throttle or an unreachable endpoint is temporary, and saying so matters:
+    /// the first fetch after launch has no earlier reading to fall back on, so the
+    /// card is left stating the problem and nothing else. Without a retry it stated
+    /// it for a full poll interval.
+    private func handleFailure(status: Int, response: URLResponse?) {
+        var reason = Self.reason(for: status)
+
+        if status == 429 || status == 0 {
+            let delay = Self.retryAfter(response)
+                ?? Self.retryDelays[min(retryAttempt, Self.retryDelays.count - 1)]
+            retryAttempt += 1
+            reason += " (retry \(Self.retryLabel(delay)))"
+            scheduleRetry(after: delay)
+        }
+        emitUnavailable(reason: reason)
+    }
+
+    /// Not `Format.resetsIn`: a reset is minutes to days away and rounds to "in 0m"
+    /// for the seconds a retry takes, which reads as "never".
+    private static func retryLabel(_ delay: TimeInterval) -> String {
+        delay < 60
+            ? "in \(Int(delay.rounded()))s"
+            : Format.resetsIn(Date().addingTimeInterval(delay))
+    }
+
+    private func scheduleRetry(after delay: TimeInterval) {
+        guard !retryScheduled else { return }
+        retryScheduled = true
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.retryScheduled = false
+            self.refresh()
+        }
+    }
+
+    /// `Retry-After` is either a delay in seconds or an HTTP date. Honouring the
+    /// server's own number beats guessing at it.
+    private static func retryAfter(_ response: URLResponse?) -> TimeInterval? {
+        guard let value = (response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespaces), !value.isEmpty else { return nil }
+
+        if let seconds = TimeInterval(value) { return max(1, seconds) }
+        guard let date = httpDateFormatter.date(from: value) else { return nil }
+        return max(1, date.timeIntervalSinceNow)
+    }
+
+    private static let httpDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "GMT")
+        f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return f
+    }()
 
     private static func reason(for status: Int) -> String {
         switch status {

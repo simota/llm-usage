@@ -11,7 +11,22 @@ agree.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **"Rate limited" was a dead end on the Claude Code card.** The OAuth usage
+  endpoint throttles aggressively — restarting the app or running two copies is
+  enough to earn a 429 — and a failure on the first fetch after launch has no
+  earlier reading to fall back on, so the card showed the plan, the account and
+  nothing else for a full five-minute poll. A 429 or a failed connection now
+  retries with backoff (30s, 60s, 120s, 300s), honours the server's `Retry-After`
+  when it sends one, and the card says when it will try again: "Rate limited
+  (retry in 30s)".
+
+### Added
+
+- `LLM_USAGE_CLAUDE_ENDPOINT` overrides the usage endpoint, the way
+  `LLM_USAGE_AGY_PORT` already overrides agy's, so the throttle-and-recover path
+  can be exercised against a stub instead of shipped untested.
 
 ## [0.1.1] - 2026-07-30
 
