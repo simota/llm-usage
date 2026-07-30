@@ -43,32 +43,57 @@ final class UsageStore: ObservableObject {
             }
     }
 
-    /// One line naming the binding constraint. Replaces a header that only
+    /// The window the summary line speaks for: the worst one on screen, and
+    /// among equals the one that will bite soonest.
+    ///
+    /// Deliberately not `binding`. Ordering by projection alone is the right
+    /// input for the menu bar's gate, but it is the wrong *subject* for a
+    /// headline: a 35% window that merely extrapolates badly outranked a visible
+    /// 87%, and the panel then announced "All healthy" directly above two
+    /// alarming cards. Ranking by `displayedSeverity` first means the line can
+    /// only say everything is fine when every window on screen is `.normal`;
+    /// the projection tie-break is retained so that among equally severe windows
+    /// the one that runs out first is still the one named.
+    var headline: (source: UsageSource, window: UsageWindow)? {
+        sources
+            .flatMap { source in source.windows.map { (source: source, window: $0) } }
+            .max { a, b in
+                let (sa, sb) = (a.window.displayedSeverity, b.window.displayedSeverity)
+                if sa != sb { return sa < sb }
+                let (pa, pb) = (a.window.projectedPercent(), b.window.projectedPercent())
+                if pa != pb { return pa < pb }
+                if a.window.isActive != b.window.isActive { return !a.window.isActive }
+                return a.window.usedPercent < b.window.usedPercent
+            }
+    }
+
+    /// One line naming the constraint that matters. Replaces a header that only
     /// repeated the app's own name.
     struct Summary {
         let text: String
         let severity: Severity
+        /// Whether the line carries a status mark. True above `.normal`, so the
+        /// headline's symbol is always the same one the named card shows.
         let isWarning: Bool
     }
 
     var summary: Summary {
-        guard let (source, window) = binding else {
+        guard let (source, window) = headline else {
             return Summary(text: "No data", severity: .normal, isWarning: false)
         }
-        let severity = Severity(usedPercent: window.usedPercent)
+        let severity = window.displayedSeverity
         let head = "\(source.displayName) \(window.label) \(Format.percent(window.usedPercent))"
 
-        if Format.overPace(window) != nil {
+        if let overPace = Format.overPace(window) {
             // The row already states the percentage; the header's job is to say
-            // what it means for you. Over-pace is always red here, matching the
-            // tick and the row caption.
-            let detail = Format.exhaustion(window) ?? Format.overPace(window)!
-            return Summary(text: "\(head) · \(detail)", severity: .critical, isWarning: true)
+            // what it means for you. A date beats a delta, so prefer exhaustion.
+            return Summary(text: "\(head) · \(Format.exhaustion(window) ?? overPace)",
+                           severity: severity, isWarning: true)
         }
-        if window.usedPercent >= 60 {
-            // High but keeping up: still worth an icon once it reaches warning.
+        if severity > .normal {
+            // High but keeping up: name it and say when the allowance returns.
             return Summary(text: "\(head) · \(Format.resetsIn(window.resetsAt))",
-                           severity: severity, isWarning: severity >= .warning)
+                           severity: severity, isWarning: true)
         }
         let nearest = sources.flatMap(\.windows).compactMap(\.resetsAt).min()
         return Summary(text: "All healthy · next reset \(Format.resetsIn(nearest))",
