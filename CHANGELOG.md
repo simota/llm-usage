@@ -11,6 +11,10 @@ agree.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-07-30
+
 The first release. Everything below is new.
 
 ### Added
@@ -53,4 +57,5 @@ The first release. Everything below is new.
 - No automated tests yet, and CI runs only on tags — nothing verifies a build on
   push or pull request.
 
-[Unreleased]: https://github.com/simota/llm-usage/commits/main
+[Unreleased]: https://github.com/simota/llm-usage/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/simota/llm-usage/releases/tag/v0.1.0
