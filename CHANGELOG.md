@@ -13,6 +13,52 @@ agree.
 
 Nothing yet.
 
+## [0.2.0] - 2026-07-31
+
+### Added
+
+- **Severity you can see without colour.** Every level now carries an SF Symbol
+  silhouette, with the tint as reinforcement rather than the only signal, so
+  caution and critical are distinguishable to colour-blind users and are spoken
+  by VoiceOver. The pace marker becomes a triangle above the track — hollow on
+  pace, filled when not — so the 0–10% over-pace band, which carries no caption,
+  still shows something.
+- **Accessibility across the panel.** Each information-bearing row is an
+  accessibility element with a label and a spoken value, including the over-pace
+  state. Refresh is a real bordered button with a Cmd-R equivalent, a failed
+  source gains a Retry, and the disclosure toggle has a hit target you can
+  actually hit.
+- **A legend behind "?"** in the footer, expanding to explain the marks and
+  costing no height until asked for.
+- Typography moves to semantic text styles, so the panel finally tracks the
+  system text size; `monospacedDigit` is preserved on every numeric column.
+
+### Fixed
+
+- **The menu bar could not show a pace warning.** It switched to the loud figure
+  only when the highest *used* percentage crossed 80, so a source burning through
+  its window at nearly twice the sustainable rate sat at 56% used and never
+  qualified — the pace warning, which is the point of the app, could not reach the
+  one surface that is always visible. The gate now reads the binding window's
+  projected consumption, the same figure the panel's headline is ranked by.
+  Thresholds are unchanged at 80/75. Consequence, accepted deliberately:
+  projection is amplified early in a window, so the gate fires more readily than
+  the old rule did and the item stays quiet less often.
+- **The summary line could contradict the cards beneath it.** It reported on the
+  window that runs out soonest rather than the worst one on screen, and so could
+  announce "All healthy" directly above an 87% card. Ranking is now by displayed
+  severity first, with the projection as the tie-break.
+- The `.tertiary` text tier is gone — at 1.83:1 it was the worst contrast in the
+  panel, and nothing needed to be that quiet.
+
+### Known limitations
+
+- In light mode the yellow and orange severity symbols fail WCAG contrast; fixing
+  it needs a custom tint rather than the system palette.
+- Still no automated test suite. The offscreen panel renders now cover the stale,
+  error, unconfigured and all-severity states that had never been drawn, and are
+  the only regression evidence the project has.
+
 ## [0.1.2] - 2026-07-30
 
 ### Fixed
@@ -92,7 +138,8 @@ The first release. Everything below is new.
 - No automated tests yet, and CI runs only on tags — nothing verifies a build on
   push or pull request.
 
-[Unreleased]: https://github.com/simota/llm-usage/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/simota/llm-usage/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/simota/llm-usage/releases/tag/v0.2.0
 [0.1.2]: https://github.com/simota/llm-usage/releases/tag/v0.1.2
 [0.1.1]: https://github.com/simota/llm-usage/releases/tag/v0.1.1
 [0.1.0]: https://github.com/simota/llm-usage/releases/tag/v0.1.0
