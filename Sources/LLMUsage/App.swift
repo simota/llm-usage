@@ -165,10 +165,14 @@ final class UsageStore: ObservableObject {
     }
 
     private func applyHysteresis() {
-        guard let used = worst?.usedPercent else { return }
+        // Gated on `binding`, not `worst`: the panel's headline is the window
+        // that bites first by *projected* consumption, and gating the menu bar
+        // on the highest *used* figure meant an over-pace source at 56% never
+        // reached the one surface that is always visible. Thresholds unchanged.
+        guard let projected = binding?.window.projectedPercent() else { return }
         if showsWorstFigure {
-            if used < Self.exitThreshold { showsWorstFigure = false }
-        } else if used >= Self.enterThreshold {
+            if projected < Self.exitThreshold { showsWorstFigure = false }
+        } else if projected >= Self.enterThreshold {
             showsWorstFigure = true
         }
     }
