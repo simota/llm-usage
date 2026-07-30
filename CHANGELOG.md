@@ -11,6 +11,10 @@ agree.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.1] - 2026-07-31
+
 ### Fixed
 
 - **The Claude Code card could say "Not signed in" right next to a known plan
@@ -170,7 +174,8 @@ The first release. Everything below is new.
 - No automated tests yet, and CI runs only on tags — nothing verifies a build on
   push or pull request.
 
-[Unreleased]: https://github.com/simota/llm-usage/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/simota/llm-usage/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/simota/llm-usage/releases/tag/v0.2.1
 [0.2.0]: https://github.com/simota/llm-usage/releases/tag/v0.2.0
 [0.1.2]: https://github.com/simota/llm-usage/releases/tag/v0.1.2
 [0.1.1]: https://github.com/simota/llm-usage/releases/tag/v0.1.1
