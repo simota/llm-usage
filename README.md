@@ -9,24 +9,24 @@ which limit runs out first, when it resets, and whether your current pace will
 hit the ceiling before it does.
 
 ```
-╭──────────────────────────────────────────────╮
-│  ⚠ Codex 7d 56% · +27% over pace             │
-│                                              │
-│  ◆ Claude Code                          Max  │
-│    5h      ▓░░░░░░░░▽░░░    8%    in 3h14m   │
-│    7d      ▓▓▓▓░░░░▽░░░░   43%    8/1(Sat)   │
-│    Credits ▓▓▓▓▓░░░░░░░░   53%     $79.71    │
-│  ────────────────────────────────────────    │
-│  ◆ Codex                                Pro  │
-│    7d      ▓▓▓▓▓│▓▓░░░░░   56%    8/4(Tue)   │
-│            ⚠ +27% over pace                  │
-│  ────────────────────────────────────────    │
-│  ◆ Antigravity                               │
-│    Gemini 5h ▓▓▓░░░▽░░░░   33%     in 59m    │
-│    Claude/GPT 7d  unused                     │
-│  ────────────────────────────────────────    │
-│  Refresh  Quit                     12s ago   │
-╰──────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────╮
+│  ⚠ Codex 7d 56% · maxes out 8/1(Sat) at this pace  │
+│                                                    │
+│  ◆ Claude Code                          Max        │
+│    5h      ▓░░░░░░░░▽░░░    8%    in 3h14m         │
+│    7d      ▓▓▓▓░░░░▽░░░░   43%    8/1(Sat)         │
+│    Credits ▓▓▓▓▓░░░░░░░░   53%     $79.71          │
+│  ────────────────────────────────────────────────  │
+│  ◆ Codex                                Pro        │
+│    7d      ▓▓▓▓▓│▓▓░░░░░   56%    8/4(Tue)         │
+│            ⚠ +27% over pace                        │
+│  ────────────────────────────────────────────────  │
+│  ◆ Antigravity                                     │
+│    Gemini 5h ▓▓▓░░░▽░░░░   33%     in 59m          │
+│    Claude/GPT 7d  unused                           │
+│  ────────────────────────────────────────────────  │
+│  Refresh  Quit                     12s ago         │
+╰────────────────────────────────────────────────────╯
 ```
 
 ## What makes it different
@@ -39,8 +39,8 @@ says by how much. It works on all three sources.
 
 **Staleness is visible.** Claude Code's token goes stale while it sits idle, and
 `agy`'s data is only reachable while `agy` is running. The app never pretends a
-stale number is current: the card dims, the dot goes hollow, and it states how
-old the value is.
+stale number is current: the card dims, its header mark switches to an outline
+glyph instead of a severity shape, and it states how old the value is.
 
 **Partial failure is normal.** One source going down leaves the other two
 displaying normally. Only the broken card looks broken.

@@ -31,8 +31,32 @@ These are the basis for every decision that follows. When in doubt, come back he
 
 | Condition | Display | Intent |
 |---|---|---|
-| Every source under 80% | **Option A** triple gauge | Stay quiet, spend no width |
-| Any source at 80% or above | **Option B** worst-one numeric | Spend width to assert, but only when it matters |
+| Every source under 80% (projected) | **Option A** triple gauge | Stay quiet, spend no width |
+| Any source's projected usage at 80% or above | **Option B** worst-one numeric | Spend width to assert, but only when it matters |
+
+The gate's input is now **`binding`'s projected figure** (`usedPercent / elapsedFraction`, §3.1) —
+not raw `usedPercent`. It used to be raw usage, which meant a source running badly over-pace but not
+yet at 80% *used* could never trip the gate — the app's headline feature (the pace marker) never
+reached the one surface that's always visible. The "stay quiet, spend no width" intent above still
+holds; what counts as "not quiet enough" is what changed. Threshold and hysteresis band stay at
+enter-80/exit-75, unchanged from below.
+
+Two honest costs that come with the fix, so a future reader doesn't mistake this for a free
+improvement:
+
+- **The gate amplifies early in a window.** `projectedPercent` only extrapolates once at least 10%
+  of the window has elapsed (below that it falls back to raw `usedPercent`, to avoid dividing by
+  something close to zero) — but at exactly that 10% mark, the multiplier is 10×. A source at 9%
+  used, 9% elapsed, sits quietly under Option A; the same source one tick later, at 10% used / 10%
+  elapsed, projects to 100% and can trip the gate outright. The threshold and deadband numbers (80/75)
+  didn't move, but what they mean in terms of raw `usedPercent` now varies with how far into the
+  window you are — narrower in absolute terms early on, identical to before once a window is mostly
+  elapsed (`elapsed → 1` makes `projected → usedPercent`).
+- **The gate and the displayed figure are no longer the same window.** When Option B is showing,
+  the number on the menu bar is `worst`'s raw `usedPercent` (the most-consumed window, unchanged
+  behaviour) — but *whether* Option B is showing is now decided by `binding`'s projection, which can
+  be a different window entirely. It is possible to see Option B's numeric display naming one
+  source's raw usage while a different, over-pace source is the reason the gate opened at all.
 
 ```
 Normal (Option A)      Strained (Option B)
@@ -96,31 +120,38 @@ The most information, but it crowds the menu bar and pushes other apps' icons ou
 `MenuBarExtra(style: .window)`, 320pt wide.
 
 ```
-╭──────────────────────────────────────────────╮
-│  ⚠ Codex 7d 56% · +27% over pace             │  ← summary line (§3.1)
-│                                              │
-│  ◆ Claude Code                          Max  │
-│    5h      ▓░░░░░░░░▽░░░    8%    in 3h14m   │
-│    7d      ▓▓▓▓░░░░▽░░░░   43%    8/1(Sat)   │
-│    Credits ▓▓▓▓▓░░░░░░░░   53%     $79.71    │
-│    ⌄ By model (1)                            │
-│  ────────────────────────────────────────    │
-│  ◆ Codex                                Pro  │
-│    7d      ▓▓▓▓▓│▓▓░░░░░   56%    8/4(Tue)   │
-│            ⚠ +27% over pace                  │
-│  ────────────────────────────────────────    │
-│  ◆ Antigravity                               │
-│    Gemini 5h ▓▓▓░░░▽░░░░   33%     in 59m    │
-│    Claude/GPT 7d  unused                     │
-│    ⓘ Shared with the desktop app and SDK     │
-│    ⌄ By model (4)                            │
-│  ────────────────────────────────────────    │
-│  Refresh  Quit                     12s ago   │
-╰──────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────╮
+│  ⚠ Codex 7d 56% · maxes out 8/1(Sat) at this pace  │  ← summary line (§3.1)
+│                                                    │
+│  ◆ Claude Code                          Max        │
+│    5h      ▓░░░░░░░░▽░░░    8%    in 3h14m         │
+│    7d      ▓▓▓▓░░░░▽░░░░   43%    8/1(Sat)         │
+│    Credits ▓▓▓▓▓░░░░░░░░   53%     $79.71          │
+│    ⌄ By model (1)                                  │
+│  ────────────────────────────────────────────────  │
+│  ◆ Codex                                Pro        │
+│    7d      ▓▓▓▓▓│▓▓░░░░░   56%    8/4(Tue)         │
+│            ⚠ +27% over pace                        │
+│  ────────────────────────────────────────────────  │
+│  ◆ Antigravity                                     │
+│    Gemini 5h ▓▓▓░░░▽░░░░   33%     in 59m          │
+│    Claude/GPT 7d  unused                           │
+│    ⓘ Shared with the desktop app and SDK           │
+│    ⌄ By model (4)                                  │
+│  ────────────────────────────────────────────────  │
+│  Refresh  Quit                     12s ago         │
+╰────────────────────────────────────────────────────╯
 ```
 
 **Don't stack card surfaces.** A `.quaternary` fill blended into the background almost entirely and landed in a
 half-state that was "neither surface nor whitespace." Separate with dividers and whitespace alone (the idiom macOS Control Center uses).
+
+**Card order stays registration order (Claude → Codex → Antigravity) — not urgency order.**
+Sorting the worst source to the top was considered and rejected: this panel refreshes every few
+seconds, and a surface that reorders itself out from under a pointer that was about to click
+something is a known calm-UI failure. The summary line (§3.1) is the promotion mechanism — it already
+names the worst source in place, at the top, without moving anything else. Don't re-propose
+urgency-sorting the cards without first changing how often the panel refreshes.
 
 ### 3.1 Summary line — put the conclusion first
 
@@ -144,13 +175,30 @@ fractionAtLimit = 100 / rate                        (only when rate > 100)
 hit time        = windowStart + fractionAtLimit × span
 ```
 
-**Picking the binding window** = the one with the highest "projected usage rate at window end":
+**Two different questions need two different windows, not one.** "Which limit runs out first" and
+"what should the summary line say" sound like the same question and aren't:
+
+**Picking the binding window** = the one with the highest "projected usage rate at window end". This
+is §2's menu bar gate input, and it answers "which limit runs out first":
 
 ```
 projected = usedPercent / elapsedFraction     (leave usedPercent as is when elapsed < 10%)
 ```
 
 Above 100 it will hit the limit before the reset. Ties are settled by `is_active` (§6).
+
+**Picking the headline window** — the one the table above actually renders — ranks by
+`displayedSeverity` (§6) first, and only falls back to `binding`'s projection to break a severity
+tie, then `is_active`, then raw `usedPercent`. The summary line used to speak for `binding` directly,
+and that was a real bug, not a style choice: ordering by projection alone let a 35%-used window that
+merely extrapolated badly outrank a visible 87%, so the panel could read `All healthy` directly above
+two cards that were anything but. Severity has to be the primary key for a line that's allowed to
+say "healthy" — and now it only says that once every window on screen is `.normal`. The projection
+tie-break is kept so that among equally severe windows, the one that bites soonest is still the one
+named — that part of the original intent survives.
+
+A card's mark, the row inside that card, and the headline naming that card now all trace back to the
+same `displayedSeverity` (§6), so they can no longer disagree about how bad something is.
 Ordering by raw usage rate overvalues "a high % late in the window."
 
 ### 3.2 Collapse unused windows into one line
@@ -193,12 +241,19 @@ Each bucket of `rateLimitsByLimitId` (showing `limitName` when it exists, otherw
 **A % alone doesn't tell you whether you're overusing.** If only 40% of the weekly window has elapsed and
 54% is consumed, that is over-pace.
 
-Place a `▽` marker on the gauge at "the expected usage rate at this instant" (= the window elapsed fraction).
+Place a pace marker on the gauge at "the expected usage rate at this instant" (= the window elapsed
+fraction) — an `arrowtriangle.down` glyph, **hollow when in-pace, filled solid when over-pace.** The
+marker used to be a plain 2px rectangle that only changed hue; between 0% and +10% over pace (the
+band below where the `+14% over pace` caption fires, see below) that red rectangle was the *only*
+signal anywhere in the UI — nothing for a color-blind or greyscale-mode reader to catch. The shape
+flip closes that gap without changing when the caption itself appears.
 
 ```
   ▓▓▓▓▓▓░▽░░░░░░   54%     fill has passed the tick → over-pace
   ▓▓▓░░░░▽░░░░░░   31%     short of the tick        → room to spare
 ```
+
+(`▽`/`▲` above stand in for the hollow/filled `arrowtriangle.down` in these ASCII mocks.)
 
 ### Calculation
 
@@ -208,8 +263,10 @@ elapsedRatio  = (now - windowStart) / (windowDurationMins * 60)
 paceDelta     = usedPercent / 100 - elapsedRatio
 ```
 
-- `paceDelta > 0` → over-pace. Turn the tick red and attach `+14% over pace` to the card
-- `paceDelta <= 0` → the tick is secondary gray, no annotation
+- `paceDelta > 0` → over-pace. Fill the triangle solid (red as reinforcement, not the only cue); the
+  `+14% over pace` caption still only attaches once `paceDelta > +10%` (§6) — the shape change is
+  what covers the narrower band below that threshold, where previously nothing did
+- `paceDelta <= 0` → hollow triangle, secondary gray, no annotation
 
 ### Scope
 
@@ -235,17 +292,33 @@ windowMins  = {"5h": 300, "weekly": 10080}[window]
 
 | Row | Content | Typography |
 |---|---|---|
-| 1 | status dot `◆` + tool name + plan badge (right-aligned) | 13pt semibold / badge 10pt |
-| 1b | logged-in account | 10pt tertiary, middle truncation |
-| 2..n | window name + gauge + `%` + time to reset | 11pt / **13pt monospacedDigit** / 11pt secondary |
-| last | disclosure toggle, annotations, errors | 11pt secondary |
+| 1 | header symbol (§6) + tool name + plan badge (right-aligned) | `.callout` symbol / `.headline` name / `.caption` badge |
+| 1b | logged-in account | `.caption`, middle truncation |
+| 2..n | window name + gauge + `%` + time to reset | `.subheadline` / **`.body` semibold `monospacedDigit`** / `.subheadline` `monospacedDigit` |
+| pace annotation | `⚠ +27% over pace` | `.footnote` medium |
+| last | disclosure toggle, notes, errors | `.subheadline` |
 
-- **`%` and times are always `.monospacedDigit`**. Without monospaced digits the width jitters on every refresh
+- **Typography is semantic, not point-sized.** Every row above is a semantic text style
+  (`.caption`/`.footnote`/`.subheadline`/`.body`/`.headline`/`.callout`), not a fixed `.system(size:)`
+  — the fixed sizes were what kept the panel from responding to Dynamic Type at all (14+ sites, zero
+  semantic styles, before this pass). `.system(size:)` is zero in the view code now. The `%` column
+  keeps `.body`, the largest text in the row, because it's the one figure every row exists to show;
+  de-emphasis for a non-metering window rides on weight (`.semibold` → `.regular`) rather than on a
+  faded color, so it never drops the figure below 4.5:1 contrast to make the point.
+- **`%` and times are always `.monospacedDigit`**. Without monospaced digits the width jitters on every
+  refresh — this survives the semantic-type migration unchanged; it's the single largest regression
+  risk in that pass and is called out here on purpose
 - **Show the account on all three sources.** It duplicates when the addresses match, but authentication is
   independent per tool and can diverge. "Which login is being metered" is worth being able to confirm silently, and never more so than when they do match.
   Long addresses get middle truncation (`.truncationMode(.middle)`) to keep the domain
 - Gauge height: 6pt for a primary window / 4pt for a secondary one, fully rounded at both ends
 - Minimum row height 22pt
+- **Every information-bearing row is one VoiceOver element.** `MeterRow`, `UnusedWindowRow`,
+  `SpendRow`, the card header, and the summary line each combine into a single
+  `accessibilityElement(children: .combine)` with an explicit label and value, so VoiceOver reads "Codex,
+  7 day, 56 percent, over pace" instead of five disconnected glyphs. Purely decorative pieces (the gauge
+  track, dividers) get `.accessibilityHidden(true)` — before this pass the view code had zero
+  accessibility API usage of any kind.
 
 ### Notation rules for reset times
 
@@ -263,15 +336,35 @@ The weekday is attached because a weekly reset is remembered by which day of the
 
 ## 6. State design
 
-| State | Threshold | Gauge color | Dot | Secondary cue |
+Severity is carried by the header symbol's **shape**, with color as reinforcement rather than the
+only signal (§1). A single `◆`/`◇` diamond could only ever say "there is a state," never which one —
+converted to greyscale, all four `.ok` severities looked identical, and VoiceOver had no way to read
+the distinction either. Every severity level gets its own silhouette — round, square, triangular,
+polygonal — rather than sharing one and leaning on hue to tell them apart:
+
+| State | Threshold | Gauge color | Header symbol | Secondary cue |
 |---|---|---|---|---|
-| normal | 0–59% | accent | `◆` filled | — |
-| notice | 60–79% | yellow | `◆` filled | — |
-| warning | 80–94% | orange | `◆` filled | menu bar switches to Option B |
-| danger | 95–100% | red | `◆` filled + pulse | notification (optional) |
-| **stale** | — | 40% opacity | `◇` hollow | states `as of 12m ago` |
-| **error** | — | dashed placeholder | `◇` gray | reason + `Retry` |
-| **unconfigured** | — | gray | `◇` gray | `Configure →` |
+| normal | 0–59% | accent | `circle.fill` | — |
+| caution | 60–79% | yellow | `exclamationmark.square.fill` | — |
+| warning | 80–94% | orange | `exclamationmark.triangle.fill` | menu bar switches to Option B |
+| critical | 95–100% | red | `exclamationmark.octagon.fill` | notification (optional) |
+| **stale** | — | 40% opacity | `clock` | states `as of 12m ago` |
+| **error** | — | dashed placeholder | `xmark.octagon` | reason + `Retry` |
+| **unconfigured** | — | gray | `circle.dashed` | `Configure →` |
+
+`.ok` takes the four filled severity shapes above; the three no-data states each get their own fixed
+outline-style glyph instead of borrowing one — "we cannot tell you" is not a severity, so it doesn't
+scale on the same axis as caution → critical. Caution isn't merged into normal's circle: at 12pt,
+`exclamationmark.circle.fill` and the octagon read as the same blob, which is why caution is a square
+instead — four legible silhouettes, not three plus a near-duplicate. Each symbol also carries an
+`accessibilityValue` naming the state in words, so VoiceOver isn't left inferring severity from a
+glyph name it can't see.
+
+A card's mark is the *worst* severity across its own windows — not one window's `usedPercent` paired
+with a different window's pace, which is how a card used to out-rank or under-rank every row printed
+underneath it. When the summary line (§3.1) is naming this same card, the card's mark is raised to
+match the headline's severity too, so the card the summary points at can never show a calmer mark
+than the sentence sitting above it.
 
 ### Rendering stale / error
 
@@ -284,6 +377,11 @@ The weekday is attached because a weekly reset is remembered by which day of the
 │    ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  Unavailable             │
 │    Credentials expired               Retry ↻   │
 ```
+
+`Retry` calls the same `refreshAll()` as the panel's own Refresh control — there is no per-source
+refresh, and this isn't the place to add one. The button lives on the broken card because that's
+where the user is looking when something needs recovering (Nielsen #9), not because it only refreshes
+that source.
 
 Thresholds for calling something stale (they differ per source):
 
@@ -310,18 +408,47 @@ When agy is stopped, treat it as **stale, not error**. From the user's point of 
 "not updated because I'm not using agy" — not a failure.
 Attach `Antigravity not running` as the annotation.
 
+### Legend
+
+A first run cannot learn what a hollow triangle over a bar means from the panel alone — nothing in
+it says so. A footer `?` control expands an inline legend explaining the pace marker and all seven
+symbols above; collapsed, it costs zero standing height, so nobody pays for an explanation they
+don't need on the two-hundredth glance. It fixes discoverability's *ceiling*, not its floor — a
+2-second glance still won't teach the vocabulary, and isn't supposed to.
+
+It is a real `Button`, so VoiceOver reaches it in normal reading order and the legend rows it opens
+are ordinary accessible text, not an image. `.help()` is layered on **in addition to** that, for the
+pointer, never instead of the accessible affordance. Both a tooltip and motion on the legend's
+disclosure were flagged as non-goals in the direction that shaped this pass — decorative chrome and
+added motion generally aren't wanted here — but this one case was reviewed and kept deliberately: the
+toggle reuses the same 0.15s `easeOut` already used for the per-model disclosure (§3.3), so it isn't
+a new animation vocabulary, and the tooltip only ever restates what the accessible label already
+says. Record this as an accepted, reviewed exception rather than rediscovering it as drift later.
+
 ---
 
 ## 7. Visual language
 
 - **Material**: leave the panel background to the system material (`.regularMaterial` / Liquid Glass).
   No background color of our own, so it follows OS generations automatically
-- **Cards**: `.quaternary` fill, 8pt corner radius
-- **Icons**: vendor logos are trademarks, so they aren't used. Substitute SF Symbols plus a letter mark
-  - Claude Code → `sparkle`
-  - Codex → `chevron.left.forwardslash.chevron.right`
-  - agy → `arrow.up.forward.circle`
-- **Color**: semantic colors only. No hardcoded hex. Light and dark both supported
+- **Cards**: no fill, no corner radius. See §3, "Don't stack card surfaces" — an earlier draft of this
+  section specified `.quaternary` fill at 8pt radius, which flatly contradicted §3 within the same
+  document. It was never a live disagreement, just a line nobody deleted once §3's own experiment
+  (fill blending into the background, landing in neither-surface-nor-whitespace) settled the question.
+  §3 is the rule; this entry is gone so the document stops arguing with itself.
+- **Icons: rejected, per-source vendor marks.** An earlier draft substituted an SF Symbol per source in
+  place of the trademarked logos (Claude Code → `sparkle`, Codex → `chevron.left.forwardslash.chevron.right`,
+  agy → `arrow.up.forward.circle`). This was never built, and it should stay that way: the header symbol
+  slot now carries *state* — severity, staleness, error (§6) — and a fixed brand glyph in that same slot
+  would collide with it on every card, every refresh. The card's name text already says which source it
+  is; the symbol's job is to say how it's doing, not who it is.
+- **Color**: semantic colors only. No hardcoded hex. Light and dark both supported. **Known gap,
+  pre-existing**: `Severity.color`'s `.yellow` and `.orange` measure roughly 1.4:1 and 2.2:1 against
+  the light-mode panel background — well under WCAG 1.4.11's 3:1 for non-text UI. This isn't new to
+  this pass and isn't fixed by it: these are dynamic system colors, not a token choice, and the fix
+  would be a custom tint, which the "use what the system supplies" direction rules out. Shape (§6)
+  already carries the severity these colors reinforce, so the gap is contained rather than silent —
+  but it's recorded here so it isn't rediscovered as a new regression later.
 - **Animation**:
   - value change → interpolate the gauge over 0.25s ease-out
   - reset reached → return to zero over 0.6s (a satisfying moment, so stage it)
@@ -335,12 +462,33 @@ Attach `Antigravity not running` as the annotation.
 |---|---|
 | left click | open / close the panel |
 | right click | short menu (Refresh / Settings / Quit) |
-| `⌘R` | force-refresh every source (Claude shows a cooldown to avoid 429s) |
+| `⌘R` | force-refresh every source — the keyboard equivalent of the Refresh button |
 | `Esc` | close the panel |
 | click a card | expand / collapse the per-model buckets |
 | threshold exceeded | Notification Center (off by default, on via settings) |
 
-While the `⌘R` cooldown runs, the refresh button is disabled and carries `42s left`.
+**Not implemented**: an earlier draft of this spec described a refresh cooldown ("Claude shows a
+cooldown to avoid 429s," the button disabled and reading `42s left`). That never shipped — `⌘R` and
+the Refresh button both call the same unthrottled `refreshAll()`. If a hammered `⌘R` turns out to
+actually draw 429s, add the cooldown then; don't carry speculative throttling in the doc as if it
+were live behavior.
+
+**Refresh, Quit, and the disclosure toggle all reach a real 24×24pt hit target (WCAG 2.5.8), but not
+by the same route** — the glyph-sized version measured under 20×20pt, below both that and the HIG's
+44×44, and none of the three drew a focus ring.
+
+- **Refresh** is `.buttonStyle(.bordered)` — a real control, hit area and focus ring included. This
+  is the one place `.bordered` was checked against `--panel` offscreen rendering and it survived;
+  `.link` was the style that didn't (see the Retry button, §6, which is `.bordered` for the same
+  reason).
+- **Quit** stays `.plain`, on purpose, not as a fallback: it is the destructive action with no
+  confirm step, so it keeps a visibly lighter weight than `Refresh` and sits at the opposite end of
+  the row rather than beside it. Its 24pt hit area comes from an explicit `.frame(minHeight:)` +
+  `.contentShape(Rectangle())`, the same mechanism as the disclosure toggle below — separation by
+  position and chrome, not by fading a label to unreadable contrast.
+- **The disclosure toggle** is also `.plain` + `.frame(minHeight: 24)` + `.contentShape(Rectangle())`.
+  A chevron doesn't read as a bordered button at any size, so the fix here is the hit area alone, not
+  a style change.
 
 ---
 
@@ -382,6 +530,10 @@ Effective gauge width: `296 − (72 + 44 + 56 + 6×3) = 106pt`
 `LLMUsage --panel <dir>` writes out PNGs in both light and dark. The panel only appears once you click
 the menu bar, so overflow, truncation, and column misalignment are easy to miss by eye.
 Use `ImageRenderer` (`NSHostingView.cacheDisplay` drops text).
+
+**There is no automated test suite** (no `.testTarget`, no `Tests/` directory). `--panel` and
+`--icon` renders plus manual/visual review are the whole of verification; treat any claim of
+"tested" elsewhere as meaning that, not an XCTest run.
 
 ---
 
