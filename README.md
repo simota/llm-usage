@@ -54,7 +54,7 @@ displaying normally. Only the broken card looks broken.
 | Source | Needs | Notes |
 |---|---|---|
 | Codex | `codex` on `PATH` | Runs `codex app-server` as a child process and reads its push notifications |
-| Claude Code | A Claude Code login; `claude` on `PATH` for the plan and account | Reads the `Claude Code-credentials` keychain item **read-only**. macOS prompts for access the first time |
+| Claude Code | A Claude Code login; `claude` on `PATH` for the plan and account | Reads the `Claude Code-credentials` keychain item **read-only**, through the same `/usr/bin/security` Claude Code writes it with, so macOS does not prompt |
 | Antigravity | `agy` running | Talks to the language server `agy` starts on localhost. No auth needed, but the port closes when `agy` exits |
 
 ## Install
@@ -96,8 +96,9 @@ make install PREFIX=$HOME/Applications
 
 `make uninstall` removes it again.
 
-> The bundle is ad-hoc signed, and a keychain ACL is bound to the signature.
-> macOS will ask for keychain access again after each rebuild.
+> The bundle is ad-hoc signed, so every build is a different application as far
+> as macOS is concerned. The keychain read goes through `/usr/bin/security` for
+> exactly that reason, and no longer asks for access after a rebuild.
 
 ## Release
 
@@ -153,6 +154,13 @@ stays current on its own.
 server-side, so refreshing it from here would break your Claude Code login. The
 app reads the keychain, and re-reads it each cycle to pick up whatever Claude
 Code refreshed on its own.
+
+The read runs `/usr/bin/security find-generic-password` — the same binary Claude
+Code stores the item with, so it is already on the item's access list and its
+Apple-signed identity never changes. An in-process read would instead be granted
+to this build's signature alone and be denied, and prompt, after the next
+rebuild. Nothing extra is granted: the access-list entry is Claude Code's own,
+and the token comes back on a pipe rather than in an argument list.
 
 Because two of the three paths are unofficial, a CLI update can break them.
 Each source degrades on its own rather than taking the app down.

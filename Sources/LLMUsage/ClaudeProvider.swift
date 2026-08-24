@@ -106,11 +106,11 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     /// `lastGood` and the retry counters were already written from the fetch completion.
     /// One queue owns all of it.
     ///
-    /// It also keeps the read off the main thread, which matters more than the race:
-    /// `SecItemCopyMatching` blocks until the user answers the access prompt, so a build
-    /// the Keychain has not been told to trust would otherwise freeze the UI thread for
-    /// as long as the dialog sits there unanswered. Observed with `make probe`, where the
-    /// same call held the process until the prompt was dealt with.
+    /// It also keeps the read off the main thread, which matters more than the race: it
+    /// spawns `/usr/bin/security` and waits for it, and any Keychain read blocks for as
+    /// long as an access dialog sits unanswered if it ever has to put one up. Observed
+    /// with `make probe` when the read was an in-process `SecItemCopyMatching`, where the
+    /// same call held the whole process until the prompt was dealt with.
     func refresh() {
         queue.async { [weak self] in self?.readCredential() }
     }
@@ -134,15 +134,15 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
                 if case .answered = reprobe { identity = reprobe }
             }
             if identity.account != nil {
-                emitUnavailable(reason: Self.unreadableReason(errSecItemNotFound))
+                emitUnavailable(reason: Self.unreadableReason(.keychain(errSecItemNotFound)))
             } else {
                 emitUnavailable(reason: "Not signed in to Claude Code")
             }
         case .expired:
             // Not an error: Claude Code renews this the next time it runs.
             emitUnavailable(reason: "Token expired (launch Claude Code to renew)")
-        case .unreadable(let status):
-            emitUnavailable(reason: Self.unreadableReason(status))
+        case .unreadable(let failure):
+            emitUnavailable(reason: Self.unreadableReason(failure))
         case .malformed:
             emitUnavailable(reason: "Credential format not recognised (Claude Code may have changed it)")
         case .token(let token):
@@ -150,28 +150,28 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         }
     }
 
-    /// The release bundle is ad-hoc signed, so every rebuild produces a new cdhash. The
-    /// Keychain item's ACL grants access by (path, cdhash), so a grant made for one build
-    /// does not carry over to the next — each new build is denied until the user approves
-    /// it again at the OS prompt. That denial surfaces as a Keychain OSStatus, not as a
-    /// missing item, which is what distinguishes this case from `.missing`.
-    ///
-    /// The card gets the short form: the note wraps at 320pt and the rebuild mechanics
-    /// above are not something the reader can act on. The status number stays because it
-    /// is the one thing that makes a report of this diagnosable. Not every denial can be
-    /// fixed by approving a prompt, so the wording has to match what actually happened:
-    /// `errSecInteractionNotAllowed` means there is no session to host a prompt in at all
-    /// (locked keychain, no UI), and the reconciliation path in `readCredential()` passes
-    /// `errSecItemNotFound` here, where there is nothing to approve or unlock — the item
-    /// just couldn't be read.
-    private static func unreadableReason(_ status: OSStatus) -> String {
-        switch status {
-        case errSecInteractionNotAllowed:
-            return "Keychain locked (unlock the login keychain) [\(status)]"
-        case errSecItemNotFound:
-            return "Keychain item unreadable [\(status)]"
-        default:
+    /// Why a read failed, in the short form: the note wraps at 320pt, so it says the one
+    /// thing the reader can act on, and carries the number that makes a report of it
+    /// diagnosable. Not every failure can be fixed by approving a prompt, so each says
+    /// what actually happened: `errSecInteractionNotAllowed` means there is no session to
+    /// host a prompt in at all (locked keychain, no UI); the reconciliation path in
+    /// `readCredential()` passes `errSecItemNotFound` here, where there is nothing to
+    /// approve or unlock — the item just couldn't be read; and a timeout means a prompt is
+    /// most likely up and unanswered, which approving fixes on the next cycle.
+    private static func unreadableReason(_ failure: ReadFailure) -> String {
+        switch failure {
+        case .keychain(errSecInteractionNotAllowed):
+            return "Keychain locked (unlock the login keychain) [\(errSecInteractionNotAllowed)]"
+        case .keychain(errSecItemNotFound):
+            return "Keychain item unreadable [\(errSecItemNotFound)]"
+        case .keychain(let status):
             return "Keychain access refused (approve the macOS prompt) [\(status)]"
+        case .exitCode(let code):
+            return "Keychain read failed (security exit \(code))"
+        case .timedOut:
+            return "Keychain read timed out (a macOS prompt may be waiting)"
+        case .notRun:
+            return "Could not run /usr/bin/security"
         }
     }
 
@@ -187,28 +187,47 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         case expired
         /// No item by this service name exists in the Keychain.
         case missing
-        /// The item exists but this process was refused access to it (ACL denial, a locked
-        /// keychain, etc.) — distinct from `.missing` because the remedy is different: grant
-        /// access, not sign in.
-        case unreadable(OSStatus)
+        /// The item could not be read: access refused, a locked keychain, a read that hung
+        /// on an unanswered dialog. Distinct from `.missing` because the remedy is
+        /// different — grant access or unlock, not sign in.
+        case unreadable(ReadFailure)
         /// The item was read successfully but its JSON didn't have the shape this decoder
         /// expects — a schema change on Claude Code's side, not an access problem.
         case malformed
     }
 
+    /// Read through `/usr/bin/security`, not `SecItemCopyMatching` — which is the whole
+    /// reason this app stopped asking for Keychain access every few days.
+    ///
+    /// An in-process read makes *this app* the accessing application, and the item's ACL
+    /// names the applications it trusts by (path, cdhash). The bundle is ad-hoc signed, so
+    /// every rebuild — and every released version — is a different application as far as
+    /// the Keychain is concerned, and each one is denied until the user approves it at the
+    /// macOS prompt all over again. Rebuilding and upgrading are routine, so the prompt
+    /// was routine.
+    ///
+    /// Claude Code writes the item by shelling out to `security`
+    /// (`add-generic-password -U -a <user> -s "Claude Code-credentials"`), which leaves
+    /// `/usr/bin/security` on the item's trusted-application list — an Apple-signed binary
+    /// whose identity never changes. Reading through it is authorised for free, however
+    /// often this app is rebuilt, and it widens nothing: the ACL entry is Claude Code's
+    /// own, already there, and this only exercises it. The absolute path is deliberate
+    /// rather than `CLI.path("security")` — what the ACL trusts is Apple's binary at that
+    /// path, not whatever a PATH lookup finds first.
+    ///
+    /// Matched by service alone, as the in-process query was: the account is the login
+    /// name today, and there is nothing to gain from pinning a second attribute.
     private static func credential() -> Credential {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess else {
-            return status == errSecItemNotFound ? .missing : .unreadable(status)
+        let output: String
+        switch securityRead() {
+        case .failure(.keychain(errSecItemNotFound)):
+            return .missing
+        case .failure(let failure):
+            return .unreadable(failure)
+        case .success(let text):
+            output = text
         }
-        guard let data = item as? Data,
+        guard let data = output.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = root["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String, !token.isEmpty
@@ -220,6 +239,78 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
             return .expired
         }
         return .token(token)
+    }
+
+    private enum ReadResult {
+        case success(String)
+        case failure(ReadFailure)
+    }
+
+    /// Why a read failed. A Keychain status where one can be recovered; otherwise the exit
+    /// code as itself, because pretending an unrecoverable one is an OSStatus prints a
+    /// number that matches no documented constant.
+    private enum ReadFailure {
+        case keychain(OSStatus)
+        case exitCode(Int32)
+        /// Still running when the watchdog fired — most likely a dialog nobody answered.
+        case timedOut
+        /// `/usr/bin/security` would not run at all, so nothing was asked of the Keychain.
+        case notRun
+    }
+
+    /// The read itself. stderr is dropped: `security` writes a human-readable line there,
+    /// too long for a 320pt note, and the exit code is what this decides on. The token
+    /// comes back on a pipe, never in an argument list, so it stays out of `ps`.
+    ///
+    /// The wait is bounded because this runs on the provider's serial queue, which also
+    /// owns the poll timer: a `security` that sits on an unanswered dialog — a locked
+    /// login keychain raises one, and so would an item whose ACL has stopped listing
+    /// `/usr/bin/security` — would otherwise hold the queue for the rest of the session
+    /// and freeze the card on its last value with nothing said. Same watchdog as
+    /// `CLI.readLoginShellPath`. Ten seconds is far longer than a granted read needs
+    /// (milliseconds) and far too short to answer a dialog in, deliberately: the point is
+    /// to report the block and let the next cycle try again, by which time approving the
+    /// dialog has made the read instant.
+    private static func securityRead() -> ReadResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", service, "-w"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return .failure(.notRun) }
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
+            if process.isRunning { process.terminate() }
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        // The watchdog's SIGTERM arrives as a signal, not as an exit code, so it cannot be
+        // confused with `security`'s own 15.
+        if process.terminationReason == .uncaughtSignal { return .failure(.timedOut) }
+        guard process.terminationStatus == 0 else {
+            return .failure(failure(forExit: process.terminationStatus))
+        }
+        let output = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return .success(output)
+    }
+
+    /// `security` exits with the Keychain OSStatus truncated to the low byte an exit code
+    /// can carry — `errSecItemNotFound` (-25300) arrives as 44 — and the high bytes are
+    /// gone, so the status cannot be reconstructed arithmetically. The four that are
+    /// actually reachable here are tabulated instead: the item is absent, the login
+    /// keychain is locked, the user answered Deny, or the user dismissed the prompt.
+    /// Anything else stays an exit code and is reported as one.
+    private static func failure(forExit code: Int32) -> ReadFailure {
+        switch code {
+        case 44: return .keychain(errSecItemNotFound)
+        case 36: return .keychain(errSecInteractionNotAllowed)
+        case 51: return .keychain(errSecAuthFailed)
+        case 128: return .keychain(errSecUserCanceled)
+        default: return .exitCode(code)
+        }
     }
 
     // MARK: - Fetch

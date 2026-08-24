@@ -11,7 +11,32 @@ agree.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **macOS asked for keychain access again after every rebuild and every
+  upgrade.** The token was read in-process with `SecItemCopyMatching`, which
+  makes this app the accessing application — and the item's ACL names the
+  applications it trusts by path and cdhash. The bundle is ad-hoc signed, so
+  every build is a different application as far as the Keychain is concerned and
+  starts out denied, prompting until it is approved again; on a machine where the
+  app is rebuilt or upgraded regularly, "once, the first time" was in practice
+  every few days. The read now runs `/usr/bin/security find-generic-password`,
+  which is how Claude Code writes the item in the first place
+  (`add-generic-password -U -a <user> -s "Claude Code-credentials"`): that binary
+  is already on the item's trusted-application list, and being Apple-signed its
+  identity never changes, so the read is authorised however often this app is
+  rebuilt. Nothing new is granted — the ACL entry is Claude Code's own, only
+  exercised and never modified — and the token still travels on a pipe rather
+  than in an argument list. Failures still name what happened: `security` reports
+  the Keychain OSStatus as an exit code truncated to a byte, and the four
+  reachable ones — item absent, login keychain locked, access denied, prompt
+  dismissed — are tabulated back to their status, so the note and the number in
+  it mean what they did; a code with no status behind it is reported as the exit
+  code it is rather than dressed up as an OSStatus that matches no documented
+  constant. The wait on the child is bounded at ten seconds, because it runs on
+  the serial queue that also owns the poll timer: a read left hanging on a dialog
+  nobody answered would otherwise hold that queue for the rest of the session and
+  freeze the card on its last value without saying why.
 
 ## [0.2.1] - 2026-07-31
 

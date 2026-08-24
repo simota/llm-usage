@@ -121,8 +121,6 @@ install: app
 	@cp -R "$(APP)" "$(INSTALLED)"
 	@open "$(INSTALLED)"
 	@echo "installed $(INSTALLED)"
-	@echo "note: macOS may ask for keychain access again after a rebuild — an"
-	@echo "      ad-hoc signature changes every time and the ACL is bound to it."
 
 ## uninstall: remove the installed bundle
 uninstall:

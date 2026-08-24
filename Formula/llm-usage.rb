@@ -53,7 +53,7 @@ class LlmUsage < Formula
         ln -sfn #{opt_prefix}/LLMUsage.app /Applications/LLMUsage.app
 
       Each source authenticates on its own: Claude Code needs a login (the app
-      reads its keychain item and macOS will ask once per version), Codex needs
+      reads its keychain item read-only, with no prompt), Codex needs
       ~/.codex/auth.json, and Antigravity needs `agy` running.
     EOS
   end
