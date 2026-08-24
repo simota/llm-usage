@@ -12,7 +12,7 @@ RELEASE_FLAGS := -c release $(foreach a,$(ARCHS),--arch $(a))
 RELEASE_BIN = $(shell swift build $(RELEASE_FLAGS) --show-bin-path 2>/dev/null | tail -1)/LLMUsage
 OUT ?= .build/preview
 
-VERSION ?= 0.2.1
+VERSION ?= 0.2.2
 APP := .build/LLMUsage.app
 DIST := .build/dist
 # The zip holds LLMUsage-<version>/LLMUsage.app rather than a bare bundle:
