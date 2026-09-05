@@ -57,14 +57,28 @@ private struct OAuthUsage: Decodable {
 /// Claude Code login. So an expired token is surfaced as staleness and the
 /// keychain is re-read each cycle to pick up whatever Claude Code last wrote.
 final class ClaudeProvider: @unchecked Sendable, UsageProviding {
-    /// Overridable the same way AgyProvider takes its port: the throttle and retry
-    /// path is unreachable against the real endpoint on demand, and shipping it
-    /// unexercised is how "Rate limited" became a dead end in the first place.
-    private static let endpoint: URL = {
-        let fallback = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-        return ProcessInfo.processInfo.environment["LLM_USAGE_CLAUDE_ENDPOINT"]
-            .flatMap(URL.init(string:)) ?? fallback
-    }()
+    enum Endpoint: Equatable, Sendable {
+        case production
+        case test(URL)
+        case invalid
+
+        static func configured(_ environment: [String: String]) -> Endpoint {
+            guard let override = environment["LLM_USAGE_CLAUDE_ENDPOINT"] else { return .production }
+            guard let url = URL(string: override),
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+                  ["localhost", "127.0.0.1", "[::1]", "::1"].contains(url.host?.lowercased() ?? ""),
+                  url.user == nil, url.password == nil else { return .invalid }
+            return .test(url)
+        }
+
+        var url: URL? {
+            switch self {
+            case .production: URL(string: "https://api.anthropic.com/api/oauth/usage")!
+            case .test(let url): url
+            case .invalid: nil
+            }
+        }
+    }
     private static let service = "Claude Code-credentials"
     /// Below ~180s the endpoint drops into an aggressively rate-limited bucket.
     private static let pollInterval: TimeInterval = 300
@@ -74,30 +88,60 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     private static let retryDelays: [TimeInterval] = [30, 60, 120, 300]
 
     private let onUpdate: @Sendable (UsageSource) -> Void
+    private let endpoint: Endpoint
+    private let session: URLSession
+    private let credentialReader: @Sendable () -> Credential
+    private let identityReader: @Sendable () -> AuthProbe
+    private let versionReader: @Sendable () -> String?
+    private let now: @Sendable () -> Date
     private var timer: DispatchSourceTimer?
     private var lastGood: UsageSource?
     private var retryAttempt = 0
-    private var retryScheduled = false
+    private var retryTask: DispatchWorkItem?
+    private var nextAllowedFetchAt: Date?
+    private var fetchTask: URLSessionDataTask?
+    private var inFlight = false
+    private var running = false
+    private var generation = 0
+    private var sessionToken: String?
     private let queue = DispatchQueue(label: "llm-usage.claude")
-    private lazy var userAgent = "claude-code/\(Self.claudeVersion() ?? "0.0.0")"
-    /// Cached at launch, but no longer only-ever-read: the disagreement check in
-    /// `readCredential()` below re-queries and overwrites it, since a launch-time cache
-    /// can outlive a `claude logout` that happens afterward. It's only overwritten with an
-    /// `.answered` re-probe, though — an `.unreachable` one means the re-probe couldn't ask
-    /// at all, which says nothing about whether the user is still signed in.
-    private lazy var identity = Self.authStatus()
+    private lazy var userAgent = "claude-code/\(versionReader() ?? "0.0.0")"
+    private var identity: AuthProbe = .unreachable
 
-    init(onUpdate: @escaping @Sendable (UsageSource) -> Void) {
+    convenience init(onUpdate: @escaping @Sendable (UsageSource) -> Void) {
+        self.init(endpoint: .configured(ProcessInfo.processInfo.environment),
+                  session: .shared, credentialReader: Self.credential,
+                  identityReader: Self.authStatus, versionReader: Self.claudeVersion,
+                  now: { Date() }, onUpdate: onUpdate)
+    }
+
+    init(endpoint: Endpoint, session: URLSession,
+         credentialReader: @escaping @Sendable () -> Credential,
+         identityReader: @escaping @Sendable () -> AuthProbe,
+         versionReader: @escaping @Sendable () -> String? = { nil },
+         now: @escaping @Sendable () -> Date = { Date() },
+         onUpdate: @escaping @Sendable (UsageSource) -> Void) {
+        self.endpoint = endpoint
+        self.session = session
+        self.credentialReader = credentialReader
+        self.identityReader = identityReader
+        self.versionReader = versionReader
+        self.now = now
         self.onUpdate = onUpdate
     }
 
     func start() {
-        refresh()
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
-        t.setEventHandler { [weak self] in self?.refresh() }
-        t.resume()
-        timer = t
+        queue.async { [weak self] in
+            guard let self, !self.running else { return }
+            self.running = true
+            self.generation += 1
+            let t = DispatchSource.makeTimerSource(queue: self.queue)
+            t.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
+            t.setEventHandler { [weak self] in self?.attemptFetch() }
+            t.resume()
+            self.timer = t
+            self.attemptFetch()
+        }
     }
 
     /// Hops onto the provider's queue rather than reading state on the caller's thread.
@@ -112,26 +156,46 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     /// with `make probe` when the read was an in-process `SecItemCopyMatching`, where the
     /// same call held the whole process until the prompt was dealt with.
     func refresh() {
-        queue.async { [weak self] in self?.readCredential() }
+        queue.async { [weak self] in self?.attemptFetch() }
+    }
+
+    private func attemptFetch() {
+        guard running, !inFlight else { return }
+        if let nextAllowedFetchAt, now() < nextAllowedFetchAt {
+            scheduleRetry(at: nextAllowedFetchAt)
+            return
+        }
+        retryTask?.cancel()
+        retryTask = nil
+        guard endpoint.url != nil else {
+            emitUnavailable(reason: "Test endpoint must use a loopback URL")
+            return
+        }
+        inFlight = true
+        if case .test = endpoint {
+            // An endpoint override never reads the Keychain or attaches a real token.
+            identity = .answered(plan: nil, account: nil)
+            fetch(token: "llm-usage-test-token")
+        } else {
+            readCredential()
+        }
     }
 
     private func readCredential() {
-        switch Self.credential() {
+        defer { if fetchTask == nil { inFlight = false } }
+        switch credentialReader() {
         case .missing:
             // `authStatus()` runs `claude auth status` — a different process, unaffected by
-            // this process's Keychain ACL. If it found an account, the item cannot really be
-            // absent, so a "missing" read here is this process being denied in a way the
-            // Keychain reports as not-found rather than as an auth failure. But `identity` is
-            // a launch-time cache that never invalidates on its own, so it can still hold an
-            // account after the user runs `claude logout` — re-probe fresh here rather than
-            // trust the cache. Only an `.answered` re-probe replaces it: an `.unreachable`
-            // one (unresolved `claude` binary, a process that wouldn't spawn, unparsable
-            // output — the launchd-bare-PATH failure this app has hit before) means we
-            // couldn't ask at all, which is not evidence of a sign-out and must not blank a
-            // plan and account we already know are real.
-            if identity.account != nil {
-                let reprobe = Self.authStatus()
-                if case .answered = reprobe { identity = reprobe }
+            // this process's Keychain ACL. Re-probe because a cached account may outlive
+            // logout or account switching. An unreachable CLI is not evidence of logout;
+            // a confirmed different account must discard the previous usage sample.
+            let reprobe = identityReader()
+            if case .answered = reprobe {
+                if reprobe.account != identity.account || reprobe.account == nil {
+                    sessionToken = nil
+                    lastGood = nil
+                }
+                identity = reprobe
             }
             if identity.account != nil {
                 emitUnavailable(reason: Self.unreadableReason(.keychain(errSecItemNotFound)))
@@ -146,6 +210,13 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         case .malformed:
             emitUnavailable(reason: "Credential format not recognised (Claude Code may have changed it)")
         case .token(let token):
+            if sessionToken != token {
+                sessionToken = token
+                lastGood = nil
+                identity = identityReader()
+            } else if case .unreachable = identity {
+                identity = identityReader()
+            }
             fetch(token: token)
         }
     }
@@ -172,17 +243,34 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
             return "Keychain read timed out (a macOS prompt may be waiting)"
         case .notRun:
             return "Could not run /usr/bin/security"
+        case .outputTooLarge:
+            return "Keychain response was too large"
         }
     }
 
     func stop() {
-        timer?.cancel()
-        timer = nil
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.running = false
+            self.generation += 1
+            self.timer?.cancel()
+            self.timer = nil
+            self.retryTask?.cancel()
+            self.retryTask = nil
+            self.fetchTask?.cancel()
+            self.fetchTask = nil
+            self.inFlight = false
+            self.retryAttempt = 0
+            self.nextAllowedFetchAt = nil
+            self.sessionToken = nil
+            self.identity = .unreachable
+            self.lastGood = nil
+        }
     }
 
     // MARK: - Credential
 
-    private enum Credential {
+    enum Credential: Sendable {
         case token(String)
         case expired
         /// No item by this service name exists in the Keychain.
@@ -249,13 +337,14 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     /// Why a read failed. A Keychain status where one can be recovered; otherwise the exit
     /// code as itself, because pretending an unrecoverable one is an OSStatus prints a
     /// number that matches no documented constant.
-    private enum ReadFailure {
+    enum ReadFailure: Sendable {
         case keychain(OSStatus)
         case exitCode(Int32)
         /// Still running when the watchdog fired — most likely a dialog nobody answered.
         case timedOut
         /// `/usr/bin/security` would not run at all, so nothing was asked of the Keychain.
         case notRun
+        case outputTooLarge
     }
 
     /// The read itself. stderr is dropped: `security` writes a human-readable line there,
@@ -272,29 +361,16 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     /// to report the block and let the next cycle try again, by which time approving the
     /// dialog has made the read instant.
     private static func securityRead() -> ReadResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-s", service, "-w"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return .failure(.notRun) }
-
-        DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
-            if process.isRunning { process.terminate() }
+        switch CLI.run(executable: "/usr/bin/security",
+                       arguments: ["find-generic-password", "-s", service, "-w"]) {
+        case .success(let output):
+            return .success(output.trimmingCharacters(in: .whitespacesAndNewlines))
+        case .failure(.exitCode(let code)):
+            return .failure(failure(forExit: code))
+        case .failure(.timedOut): return .failure(.timedOut)
+        case .failure(.notRun): return .failure(.notRun)
+        case .failure(.outputTooLarge): return .failure(.outputTooLarge)
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-
-        // The watchdog's SIGTERM arrives as a signal, not as an exit code, so it cannot be
-        // confused with `security`'s own 15.
-        if process.terminationReason == .uncaughtSignal { return .failure(.timedOut) }
-        guard process.terminationStatus == 0 else {
-            return .failure(failure(forExit: process.terminationStatus))
-        }
-        let output = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return .success(output)
     }
 
     /// `security` exits with the Keychain OSStatus truncated to the low byte an exit code
@@ -316,18 +392,23 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     // MARK: - Fetch
 
     private func fetch(token: String) {
-        var request = URLRequest(url: Self.endpoint, timeoutInterval: 15)
+        guard let url = endpoint.url else { inFlight = false; return }
+        let requestGeneration = generation
+        var request = URLRequest(url: url, timeoutInterval: 15)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         // Mandatory: without it the request lands in a heavily throttled bucket.
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(endpoint == .production ? userAgent : "llm-usage-test", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+        let task = session.dataTask(with: request) { [weak self] data, response, _ in
             guard let self else { return }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             // Onto the provider's own queue: the retry bookkeeping below and the
             // timer that also calls `refresh()` must not interleave.
             self.queue.async {
+                guard self.running, self.generation == requestGeneration else { return }
+                self.fetchTask = nil
+                self.inFlight = false
                 guard status == 200, let data else {
                     self.handleFailure(status: status, response: response)
                     return
@@ -339,13 +420,19 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
                     return
                 }
                 var source = Self.normalise(usage)
+                if source.state == .ok { source.lastUpdated = self.now() }
                 source.plan = self.identity.plan
                 source.account = self.identity.account
-                self.lastGood = source
+                if source.state == .ok { self.lastGood = source }
                 self.retryAttempt = 0
+                self.nextAllowedFetchAt = nil
+                self.retryTask?.cancel()
+                self.retryTask = nil
                 self.onUpdate(source)
             }
-        }.resume()
+        }
+        fetchTask = task
+        task.resume()
     }
 
     /// A throttle or an unreachable endpoint is temporary, and saying so matters:
@@ -356,11 +443,13 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         var reason = Self.reason(for: status)
 
         if status == 429 || status == 0 {
-            let delay = Self.retryAfter(response)
+            let delay = Self.retryAfter(response, now: now())
                 ?? Self.retryDelays[min(retryAttempt, Self.retryDelays.count - 1)]
             retryAttempt += 1
             reason += " (retry \(Self.retryLabel(delay)))"
-            scheduleRetry(after: delay)
+            let deadline = now().addingTimeInterval(delay)
+            nextAllowedFetchAt = deadline
+            scheduleRetry(at: deadline)
         }
         emitUnavailable(reason: reason)
     }
@@ -373,26 +462,28 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
             : Format.resetsIn(Date().addingTimeInterval(delay))
     }
 
-    private func scheduleRetry(after delay: TimeInterval) {
-        guard !retryScheduled else { return }
-        retryScheduled = true
-        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            self.retryScheduled = false
-            self.refresh()
+    private func scheduleRetry(at deadline: Date) {
+        guard retryTask == nil, running else { return }
+        let scheduledGeneration = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.running, self.generation == scheduledGeneration else { return }
+            self.retryTask = nil
+            self.attemptFetch()
         }
+        retryTask = work
+        queue.asyncAfter(deadline: .now() + max(0, deadline.timeIntervalSince(now())), execute: work)
     }
 
     /// `Retry-After` is either a delay in seconds or an HTTP date. Honouring the
     /// server's own number beats guessing at it.
-    private static func retryAfter(_ response: URLResponse?) -> TimeInterval? {
+    static func retryAfter(_ response: URLResponse?, now: Date = Date()) -> TimeInterval? {
         guard let value = (response as? HTTPURLResponse)?
             .value(forHTTPHeaderField: "Retry-After")?
             .trimmingCharacters(in: .whitespaces), !value.isEmpty else { return nil }
 
-        if let seconds = TimeInterval(value) { return max(1, seconds) }
+        if let seconds = TimeInterval(value), seconds.isFinite { return max(1, seconds) }
         guard let date = httpDateFormatter.date(from: value) else { return nil }
-        return max(1, date.timeIntervalSinceNow)
+        return max(1, date.timeIntervalSince(now))
     }
 
     private static let httpDateFormatter: DateFormatter = {
@@ -412,11 +503,11 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         }
     }
 
-    /// Keeps the last reading visible and lets it age into `.stale` rather than
-    /// blanking the card whenever the token lapses between Claude Code runs.
+    /// Keeps the last confirmed reading visible as stale when a new fetch fails.
     private func emitUnavailable(reason: String) {
         if var previous = lastGood {
             previous.note = reason
+            previous.state = previous.lastUpdated.map { .stale(since: $0) } ?? .error(reason)
             onUpdate(previous)
         } else {
             var placeholder = UsageSource.placeholder(id: "claude", name: "Claude Code")
@@ -516,7 +607,7 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         return formatter.date(from: value)
     }
 
-    // MARK: - CLI lookups (once per launch)
+    // MARK: - CLI lookups
 
     private static func claudeVersion() -> String? {
         // "2.1.220 (Claude Code)" -> "2.1.220"
@@ -529,7 +620,7 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     /// wouldn't spawn, output that wouldn't parse). Collapsing the two into one `nil` used to
     /// make a failed probe indistinguishable from a confirmed sign-out; `readCredential()`
     /// relies on telling them apart.
-    private enum AuthProbe {
+    enum AuthProbe: Sendable {
         case unreachable
         case answered(plan: String?, account: String?)
 
@@ -556,16 +647,8 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     /// terminal run filled them in (see `CLI`).
     private static func run(_ tool: String, _ arguments: [String]) -> String? {
         guard let executable = CLI.path(tool) else { return nil }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = CLI.environment()
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard case .success(let output) = CLI.run(executable: executable, arguments: arguments,
+                                                 environment: CLI.environment(for: tool)) else { return nil }
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -34,7 +34,7 @@ class LlmUsage < Formula
 
   service do
     run [opt_prefix/"LLMUsage.app/Contents/MacOS/LLMUsage"]
-    keep_alive true
+    keep_alive crashed: true
     log_path var/"log/llm-usage.log"
     error_log_path var/"log/llm-usage.log"
   end

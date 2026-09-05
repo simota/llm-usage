@@ -5,6 +5,7 @@ let package = Package(
     name: "LLMUsage",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(name: "LLMUsage", path: "Sources/LLMUsage")
+        .executableTarget(name: "LLMUsage", path: "Sources/LLMUsage"),
+        .testTarget(name: "LLMUsageTests", dependencies: ["LLMUsage"])
     ]
 )

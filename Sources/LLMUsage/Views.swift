@@ -71,34 +71,6 @@ extension Severity {
         }
     }
 
-    /// A window burning faster than it refills reads worse than its raw figure —
-    /// but only once the burn is worth naming.
-    ///
-    /// Two tiers, deliberately: the pace marker fills at *any* delta above zero,
-    /// because being a little ahead early in a window is the normal noisy state
-    /// and a quiet shape change is the right weight for it. Severity — the thing
-    /// that colours the bar and picks the card's mark — moves only above
-    /// `Format.overPaceThreshold`, the same line `Format.overPace` and
-    /// `UsageStore.summary` already use. Escalating on any positive delta made a
-    /// source at 5% used wear a warning triangle.
-    static func escalated(_ base: Severity, paceDelta: Double?) -> Severity {
-        guard let paceDelta, paceDelta > Format.overPaceThreshold else { return base }
-        return Swift.max(base, .critical)
-    }
-}
-
-extension UsageWindow {
-    /// The severity the panel actually shows for this window.
-    ///
-    /// Defined once because the three places that report severity were ranking
-    /// different subjects: the row and the gauge spoke per window, the card mark
-    /// mixed one window's consumption with another's pace, and the headline read
-    /// a single window chosen by projection. Now they nest — row, then the max
-    /// over a source, then the max over the panel — so a card cannot wear a mark
-    /// the headline contradicts.
-    var displayedSeverity: Severity {
-        Severity.escalated(Severity(usedPercent: usedPercent), paceDelta: paceDelta())
-    }
 }
 
 // MARK: - Spoken forms
@@ -465,7 +437,7 @@ struct SourceCardView: View {
                     SpendRow(sourceName: source.displayName, spend: spend, dimmed: dimmed)
                 }
                 if case .stale(let since) = state {
-                    Label("as of \(Format.relative(since))", systemImage: "clock")
+                    Label("Last known · \(Format.relative(since))", systemImage: "clock")
                         .font(.subheadline)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -696,7 +668,8 @@ struct PanelView: View {
                 Text(Format.relative(store.lastRefreshed))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .accessibilityLabel("Last refreshed \(Format.relative(store.lastRefreshed))")
+                    .help("Last successful sample")
+                    .accessibilityLabel("Last successful sample \(Format.relative(store.lastRefreshed))")
 
                 // Quit used to sit beside Refresh at identical weight. It is the
                 // destructive one and there is no confirm step, so it gets the

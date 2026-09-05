@@ -34,7 +34,7 @@ These are the basis for every decision that follows. When in doubt, come back he
 | Every source under 80% (projected) | **Option A** triple gauge | Stay quiet, spend no width |
 | Any source's projected usage at 80% or above | **Option B** worst-one numeric | Spend width to assert, but only when it matters |
 
-The gate's input is now **`binding`'s projected figure** (`usedPercent / elapsedFraction`, §3.1) —
+The gate's input is the **highest projected figure among current windows** (`usedPercent / elapsedFraction`, §3.1) —
 not raw `usedPercent`. It used to be raw usage, which meant a source running badly over-pace but not
 yet at 80% *used* could never trip the gate — the app's headline feature (the pace marker) never
 reached the one surface that's always visible. The "stay quiet, spend no width" intent above still
@@ -54,7 +54,7 @@ improvement:
   elapsed (`elapsed → 1` makes `projected → usedPercent`).
 - **The gate and the displayed figure are no longer the same window.** When Option B is showing,
   the number on the menu bar is `worst`'s raw `usedPercent` (the most-consumed window, unchanged
-  behaviour) — but *whether* Option B is showing is now decided by `binding`'s projection, which can
+  behaviour) — but *whether* Option B is showing is decided by the highest projection, which can
   be a different window entirely. It is possible to see Option B's numeric display naming one
   source's raw usage while a different, over-pace source is the reason the gate opened at all.
 
@@ -178,24 +178,25 @@ hit time        = windowStart + fractionAtLimit × span
 **Two different questions need two different windows, not one.** "Which limit runs out first" and
 "what should the summary line say" sound like the same question and aren't:
 
-**Picking the binding window** = the one with the highest "projected usage rate at window end". This
-is §2's menu bar gate input, and it answers "which limit runs out first":
+**Picking the binding window** compares predicted exhaustion dates among current windows.
+Different durations can have opposite projection and exhaustion rankings: 50% used at 20%
+elapsed in a 5h window runs out in 1h; 40% used at 10% elapsed in a weekly window runs out
+in 25.2h. The 5h window binds despite its lower end-of-window projection.
 
 ```
-projected = usedPercent / elapsedFraction     (leave usedPercent as is when elapsed < 10%)
+exhaustion = windowStart + windowDuration * elapsedFraction * 100 / usedPercent
 ```
 
-Above 100 it will hit the limit before the reset. Ties are settled by `is_active` (§6).
+Only dates before reset count. A window already at 100% binds immediately. Without a
+prediction, ties use `is_active`, raw usage, then ID. The menu bar gate separately uses
+the highest projected percentage (§2).
 
 **Picking the headline window** — the one the table above actually renders — ranks by
-`displayedSeverity` (§6) first, and only falls back to `binding`'s projection to break a severity
-tie, then `is_active`, then raw `usedPercent`. The summary line used to speak for `binding` directly,
-and that was a real bug, not a style choice: ordering by projection alone let a 35%-used window that
-merely extrapolated badly outrank a visible 87%, so the panel could read `All healthy` directly above
-two cards that were anything but. Severity has to be the primary key for a line that's allowed to
-say "healthy" — and now it only says that once every window on screen is `.normal`. The projection
-tie-break is kept so that among equally severe windows, the one that bites soonest is still the one
-named — that part of the original intent survives.
+`displayedSeverity` (§6) first, then the earliest exhaustion date, activity, and raw usage.
+Stale, failed, unconfigured, and pre-reset samples do not participate in current health.
+`All healthy` requires current data for every source; partial data names the number unavailable.
+With no current windows the summary says `No current data`. Old card values are labeled `Last known`.
+The footer reports the most recent successful sample timestamp, not the last fetch attempt.
 
 A card's mark, the row inside that card, and the headline naming that card now all trace back to the
 same `displayedSeverity` (§6), so they can no longer disagree about how bad something is.
@@ -531,9 +532,10 @@ Effective gauge width: `296 − (72 + 44 + 56 + 6×3) = 106pt`
 the menu bar, so overflow, truncation, and column misalignment are easy to miss by eye.
 Use `ImageRenderer` (`NSHostingView.cacheDisplay` drops text).
 
-**There is no automated test suite** (no `.testTarget`, no `Tests/` directory). `--panel` and
-`--icon` renders plus manual/visual review are the whole of verification; treat any claim of
-"tested" elsewhere as meaning that, not an XCTest run.
+`swift test` runs isolated XCTest regressions for provider normalization, subprocess and RPC
+failures, fetch lifecycle, identity changes, projections, and freshness. PR CI also builds
+the release binary and checks the Formula's Ruby syntax. `--panel` and `--icon` complement
+those checks with fixture rendering; real credentials and services are not used by the tests.
 
 ---
 

@@ -1,190 +1,31 @@
 import AppKit
 import SwiftUI
 
-// MARK: - Store
-
-@MainActor
-final class UsageStore: ObservableObject {
-    @Published private(set) var sources: [UsageSource]
-    @Published private(set) var lastRefreshed: Date?
-    /// Drives the A/B swap in the menu bar. Hysteresis lives in `applyHysteresis`.
-    @Published private(set) var showsWorstFigure = false
-
-    private static let enterThreshold: Double = 80
-    private static let exitThreshold: Double = 75
-
-    private var providers: [UsageProviding] = []
-    private var tick: Timer?
-    private var lastResetRefresh: Date?
-
-    init(sources: [UsageSource]? = nil) {
-        self.sources = sources ?? [
-            UsageSource.placeholder(id: "claude", name: "Claude Code"),
-            UsageSource.placeholder(id: "codex", name: "Codex"),
-            UsageSource.placeholder(id: "agy", name: "Antigravity"),
-        ]
-    }
-
-    /// The most consumed window across every source that currently has data.
-    var worst: UsageWindow? {
-        sources.compactMap(\.worstWindow).max { $0.usedPercent < $1.usedPercent }
-    }
-
-    /// The window that will bite first, by projected end-of-window consumption.
-    /// Ties go to whichever the source says is actively metering.
-    var binding: (source: UsageSource, window: UsageWindow)? {
-        sources
-            .flatMap { source in source.windows.map { (source: source, window: $0) } }
-            .max { a, b in
-                let (pa, pb) = (a.window.projectedPercent(), b.window.projectedPercent())
-                if pa != pb { return pa < pb }
-                if a.window.isActive != b.window.isActive { return !a.window.isActive }
-                return a.window.usedPercent < b.window.usedPercent
-            }
-    }
-
-    /// The window the summary line speaks for: the worst one on screen, and
-    /// among equals the one that will bite soonest.
-    ///
-    /// Deliberately not `binding`. Ordering by projection alone is the right
-    /// input for the menu bar's gate, but it is the wrong *subject* for a
-    /// headline: a 35% window that merely extrapolates badly outranked a visible
-    /// 87%, and the panel then announced "All healthy" directly above two
-    /// alarming cards. Ranking by `displayedSeverity` first means the line can
-    /// only say everything is fine when every window on screen is `.normal`;
-    /// the projection tie-break is retained so that among equally severe windows
-    /// the one that runs out first is still the one named.
-    var headline: (source: UsageSource, window: UsageWindow)? {
-        sources
-            .flatMap { source in source.windows.map { (source: source, window: $0) } }
-            .max { a, b in
-                let (sa, sb) = (a.window.displayedSeverity, b.window.displayedSeverity)
-                if sa != sb { return sa < sb }
-                let (pa, pb) = (a.window.projectedPercent(), b.window.projectedPercent())
-                if pa != pb { return pa < pb }
-                if a.window.isActive != b.window.isActive { return !a.window.isActive }
-                return a.window.usedPercent < b.window.usedPercent
-            }
-    }
-
-    /// One line naming the constraint that matters. Replaces a header that only
-    /// repeated the app's own name.
-    struct Summary {
-        let text: String
-        let severity: Severity
-        /// Whether the line carries a status mark. True above `.normal`, so the
-        /// headline's symbol is always the same one the named card shows.
-        let isWarning: Bool
-    }
-
-    var summary: Summary {
-        guard let (source, window) = headline else {
-            return Summary(text: "No data", severity: .normal, isWarning: false)
-        }
-        let severity = window.displayedSeverity
-        let head = "\(source.displayName) \(window.label) \(Format.percent(window.usedPercent))"
-
-        if let overPace = Format.overPace(window) {
-            // The row already states the percentage; the header's job is to say
-            // what it means for you. A date beats a delta, so prefer exhaustion.
-            return Summary(text: "\(head) · \(Format.exhaustion(window) ?? overPace)",
-                           severity: severity, isWarning: true)
-        }
-        if severity > .normal {
-            // High but keeping up: name it and say when the allowance returns.
-            return Summary(text: "\(head) · \(Format.resetsIn(window.resetsAt))",
-                           severity: severity, isWarning: true)
-        }
-        let nearest = sources.flatMap(\.windows).compactMap(\.resetsAt).min()
-        return Summary(text: "All healthy · next reset \(Format.resetsIn(nearest))",
-                       severity: .normal, isWarning: false)
-    }
-
-    func start() {
-        providers = [
-            CodexProvider { [weak self] result in
-                Task { @MainActor in self?.apply(result, to: "codex") }
-            },
-            ClaudeProvider { [weak self] source in
-                Task { @MainActor in self?.apply(.success(source), to: "claude") }
-            },
-            AgyProvider { [weak self] source in
-                Task { @MainActor in self?.apply(.success(source), to: "agy") }
-            },
-        ]
-        providers.forEach { $0.start() }
-
-        // Re-render so relative timestamps and pace ticks keep moving.
-        tick = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.objectWillChange.send()
-                self?.refreshIfWindowRolledOver()
-            }
-        }
-    }
-
-    /// A window that has passed its reset time is showing pre-reset consumption
-    /// until the next poll, which can be minutes away. Go and look immediately.
-    private func refreshIfWindowRolledOver() {
-        let now = Date()
-        if let last = lastResetRefresh, now.timeIntervalSince(last) < 120 { return }
-
-        let rolledOver = sources.contains { source in
-            guard let updated = source.lastUpdated else { return false }
-            return source.windows.contains { window in
-                guard let resetsAt = window.resetsAt else { return false }
-                return resetsAt < now && updated < resetsAt
-            }
-        }
-        guard rolledOver else { return }
-        lastResetRefresh = now
-        refreshAll()
-    }
-
-    func refreshAll() {
-        providers.forEach { $0.refresh() }
-    }
-
-    func stop() {
-        tick?.invalidate()
-        providers.forEach { $0.stop() }
-        providers = []
-    }
-
-    private func apply(_ result: Result<UsageSource, Error>, to id: String) {
-        guard let index = sources.firstIndex(where: { $0.id == id }) else { return }
-        switch result {
-        case .success(let source):
-            sources[index] = source
-            // A placeholder card is not a refresh; only real data moves the clock.
-            if case .ok = source.state { lastRefreshed = Date() }
-        case .failure(let error):
-            sources[index].state = .error(error.localizedDescription)
-        }
-        applyHysteresis()
-    }
-
-    private func applyHysteresis() {
-        // Gated on `binding`, not `worst`: the panel's headline is the window
-        // that bites first by *projected* consumption, and gating the menu bar
-        // on the highest *used* figure meant an over-pace source at 56% never
-        // reached the one surface that is always visible. Thresholds unchanged.
-        guard let projected = binding?.window.projectedPercent() else { return }
-        if showsWorstFigure {
-            if projected < Self.exitThreshold { showsWorstFigure = false }
-        } else if projected >= Self.enterThreshold {
-            showsWorstFigure = true
-        }
-    }
-}
-
 // MARK: - App
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    let store: UsageStore
+
+    override init() {
+        store = UsageStore()
+        super.init()
+    }
+
+    init(store: UsageStore) {
+        self.store = store
+        super.init()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Menu bar only — no Dock icon, no main window. Equivalent to LSUIElement
         // without needing an Info.plist, which keeps this a plain SwiftPM executable.
         NSApp.setActivationPolicy(.accessory)
+        store.start()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        store.stop()
     }
 }
 
@@ -317,7 +158,6 @@ final class Mutex<Value>: @unchecked Sendable {
 @main
 struct LLMUsageApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var store = UsageStore()
 
     init() {
         let args = CommandLine.arguments
@@ -335,10 +175,9 @@ struct LLMUsageApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            PanelView(store: store)
-                .task { store.start() }
+            PanelView(store: delegate.store)
         } label: {
-            MenuBarLabel(store: store)
+            MenuBarLabel(store: delegate.store)
         }
         .menuBarExtraStyle(.window)
     }
