@@ -37,8 +37,30 @@ final class CLITests: XCTestCase {
     }
 
     func testNonzeroExitIsFailureEvenWithOutput() {
-        let result = CLI.run(executable: "/bin/sh", arguments: ["-c", "printf misleading; exit 17"])
-        XCTAssertEqual(result, .failure(.exitCode(17)))
+        for code in [Int32(1), 17] {
+            let result = CLI.run(executable: "/bin/sh", arguments: ["-c", "printf misleading; exit \(code)"])
+            XCTAssertEqual(result, .failure(.exitCode(code)))
+        }
+    }
+
+    func testExplicitlyAcceptedExitCodesPreserveOutput() {
+        for code in [0, 1] {
+            let result = CLI.run(executable: "/bin/sh", arguments: ["-c", "printf expected; exit \(code)"],
+                                 acceptedExitCodes: [0, 1])
+            XCTAssertEqual(result, .success("expected"))
+        }
+    }
+
+    func testUnacceptedExitCodeIsFailureEvenWithOutput() {
+        let result = CLI.run(executable: "/bin/sh", arguments: ["-c", "printf misleading; exit 2"],
+                             acceptedExitCodes: [0, 1])
+        XCTAssertEqual(result, .failure(.exitCode(2)))
+    }
+
+    func testSignalTerminationIsFailureEvenWhenItsStatusIsAccepted() {
+        let result = CLI.run(executable: "/bin/sh", arguments: ["-c", "printf misleading; kill -HUP $$"],
+                             acceptedExitCodes: [0, 1])
+        XCTAssertEqual(result, .failure(.exitCode(1)))
     }
 
     func testTimeoutTerminatesProcessThatIgnoresTerm() {

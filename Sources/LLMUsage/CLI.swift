@@ -139,7 +139,8 @@ enum CLI {
     /// defeating the deadline. Output is bounded and never written to disk.
     static func run(executable: String, arguments: [String],
                     environment: [String: String]? = nil,
-                    timeout: TimeInterval = 10) -> Result<String, RunFailure> {
+                    timeout: TimeInterval = 10,
+                    acceptedExitCodes: Set<Int32> = [0]) -> Result<String, RunFailure> {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -196,7 +197,9 @@ enum CLI {
             }
             return .failure(failure)
         }
-        guard process.terminationStatus == 0 else { return .failure(.exitCode(process.terminationStatus)) }
+        guard process.terminationReason == .exit,
+              acceptedExitCodes.contains(process.terminationStatus)
+        else { return .failure(.exitCode(process.terminationStatus)) }
         return .success(String(decoding: output, as: UTF8.self))
     }
 }

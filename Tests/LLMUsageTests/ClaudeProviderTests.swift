@@ -115,6 +115,66 @@ final class ClaudeProviderTests: XCTestCase {
         XCTAssertTrue(failed.windows.isEmpty)
     }
 
+    func testSameAccountTokenRefreshPreservesLastGoodOnTransientFailure() throws {
+        for status in [503, 429] {
+            let harness = ClaudeHTTPHarness()
+            let updates = Mutex<[UsageSource]>([])
+            let token = Mutex("fixture-first-token")
+            let sampledAt = Date(timeIntervalSince1970: 2_000)
+            let provider = makeProvider(harness, updates: updates,
+                                        credential: { .token(token.withLock { $0 }) },
+                                        identity: { .answered(plan: "Pro", account: "first@example.test") },
+                                        now: { sampledAt })
+            defer { provider.stop() }
+            provider.start()
+            try awaitCount(harness, 1)
+            harness.respond(0, status: 200)
+            try awaitUpdates(updates, 1)
+            token.withLock { $0 = "fixture-refreshed-token" }
+            provider.refresh()
+            try awaitCount(harness, 2)
+            XCTAssertEqual(harness.request(1).value(forHTTPHeaderField: "Authorization"),
+                           "Bearer fixture-refreshed-token")
+            harness.respond(1, status: status)
+            try awaitUpdates(updates, 2)
+            let failed = try XCTUnwrap(updates.withLock { $0.last })
+            XCTAssertEqual(failed.account, "first@example.test")
+            XCTAssertEqual(failed.plan, "Pro")
+            XCTAssertEqual(failed.lastUpdated, sampledAt)
+            XCTAssertEqual(failed.windows.first?.usedPercent, 25)
+            XCTAssertEqual(failed.state, .stale(since: sampledAt))
+        }
+    }
+
+    func testNewCredentialWithChangedOrUnknownAccountDiscardsPreviousSample() throws {
+        for account: String? in ["second@example.test", nil] {
+            let harness = ClaudeHTTPHarness()
+            let updates = Mutex<[UsageSource]>([])
+            let token = Mutex("fixture-first-token")
+            let identity = Mutex<ClaudeProvider.AuthProbe>(.answered(plan: "Pro", account: "first@example.test"))
+            let provider = makeProvider(harness, updates: updates,
+                                        credential: { .token(token.withLock { $0 }) },
+                                        identity: { identity.withLock { $0 } })
+            defer { provider.stop() }
+            provider.start()
+            try awaitCount(harness, 1)
+            harness.respond(0, status: 200)
+            try awaitUpdates(updates, 1)
+            token.withLock { $0 = "fixture-second-token" }
+            identity.withLock { $0 = .answered(plan: "Max", account: account) }
+            provider.refresh()
+            try awaitCount(harness, 2)
+            harness.respond(1, status: 503)
+            try awaitUpdates(updates, 2)
+            let failed = try XCTUnwrap(updates.withLock { $0.last })
+            XCTAssertEqual(failed.account, account)
+            XCTAssertEqual(failed.plan, "Max")
+            XCTAssertNil(failed.lastUpdated)
+            XCTAssertTrue(failed.windows.isEmpty)
+            XCTAssertEqual(failed.state, .unconfigured)
+        }
+    }
+
     func testFailurePreservesSampleTimestampButIsNotHealthy() throws {
         let harness = ClaudeHTTPHarness()
         let updates = Mutex<[UsageSource]>([])
@@ -160,6 +220,73 @@ final class ClaudeProviderTests: XCTestCase {
         XCTAssertEqual(harness.count, 1)
     }
 
+    func testExitOneLogoutClearsCachedIdentityAndLastGood() throws {
+        let executable = try authStatusFixture()
+        defer { try? FileManager.default.removeItem(at: executable) }
+        let environment = Mutex([
+            "FIXTURE_AUTH_JSON": #"{"loggedIn":true,"subscriptionType":"pro","email":"first@example.test"}"#,
+            "FIXTURE_AUTH_EXIT": "0"
+        ])
+        let harness = ClaudeHTTPHarness()
+        let updates = Mutex<[UsageSource]>([])
+        let credential = Mutex<ClaudeProvider.Credential>(.token("fixture-token"))
+        let provider = makeProvider(harness, updates: updates,
+                                    credential: { credential.withLock { $0 } },
+                                    identity: {
+            ClaudeProvider.authStatus(executable: executable.path, environment: environment.withLock { $0 })
+        })
+        defer { provider.stop() }
+        provider.start()
+        try awaitCount(harness, 1)
+        harness.respond(0, status: 200)
+        try awaitUpdates(updates, 1)
+        XCTAssertEqual(updates.withLock { $0.last?.account }, "first@example.test")
+        XCTAssertEqual(updates.withLock { $0.last?.plan }, "Pro")
+        credential.withLock { $0 = .missing }
+        environment.withLock {
+            $0 = ["FIXTURE_AUTH_JSON": #"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#,
+                  "FIXTURE_AUTH_EXIT": "1"]
+        }
+        provider.refresh()
+        try awaitUpdates(updates, 2)
+        let loggedOut = try XCTUnwrap(updates.withLock { $0.last })
+        XCTAssertNil(loggedOut.account)
+        XCTAssertNil(loggedOut.plan)
+        XCTAssertNil(loggedOut.lastUpdated)
+        XCTAssertTrue(loggedOut.windows.isEmpty)
+        XCTAssertEqual(loggedOut.state, .unconfigured)
+        XCTAssertEqual(loggedOut.note, "Not signed in to Claude Code")
+        XCTAssertEqual(harness.count, 1)
+
+        // Reusing the fixture token proves logout invalidated the token cache too.
+        credential.withLock { $0 = .token("fixture-token") }
+        environment.withLock {
+            $0 = ["FIXTURE_AUTH_JSON": #"{"loggedIn":true,"subscriptionType":"max","email":"second@example.test"}"#,
+                  "FIXTURE_AUTH_EXIT": "0"]
+        }
+        provider.refresh()
+        try awaitCount(harness, 2)
+        harness.respond(1, status: 200)
+        try awaitUpdates(updates, 3)
+        XCTAssertEqual(updates.withLock { $0.last?.account }, "second@example.test")
+        XCTAssertEqual(updates.withLock { $0.last?.plan }, "Max")
+    }
+
+    func testAuthStatusRejectsFailuresAndMalformedOutput() throws {
+        let executable = try authStatusFixture()
+        defer { try? FileManager.default.removeItem(at: executable) }
+        for (json, exitCode) in [("", "1"), ("not json", "1"), ("[]", "1"),
+                                 (#"{"loggedIn":false}"#, "2")] {
+            let probe = ClaudeProvider.authStatus(executable: executable.path,
+                                                  environment: ["FIXTURE_AUTH_JSON": json,
+                                                                "FIXTURE_AUTH_EXIT": exitCode])
+            guard case .unreachable = probe else {
+                XCTFail("Expected an unreachable probe for exit \(exitCode) with \(json)")
+                continue
+            }
+        }
+    }
+
     func testEndpointOverrideUsesOnlyMockCredential() throws {
         let harness = ClaudeHTTPHarness()
         let reads = Mutex(0)
@@ -200,6 +327,18 @@ final class ClaudeProviderTests: XCTestCase {
         XCTAssertEqual(ClaudeProvider.retryAfter(dated, now: now), 600)
         let invalid = HTTPURLResponse(url: url, statusCode: 429, httpVersion: nil, headerFields: ["Retry-After": "inf"])
         XCTAssertNil(ClaudeProvider.retryAfter(invalid, now: now))
+    }
+
+    private func authStatusFixture() throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try """
+        #!/bin/sh
+        [ "$*" = "auth status --json" ] || exit 64
+        printf '%s\\n' "$FIXTURE_AUTH_JSON"
+        exit "$FIXTURE_AUTH_EXIT"
+        """.write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url
     }
 
     private func makeProvider(_ harness: ClaudeHTTPHarness,

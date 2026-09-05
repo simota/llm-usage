@@ -211,9 +211,14 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
             emitUnavailable(reason: "Credential format not recognised (Claude Code may have changed it)")
         case .token(let token):
             if sessionToken != token {
+                let reprobe = identityReader()
+                // Tokens rotate within an account; keep its sample only when the
+                // new credential's account can be confirmed as the same one.
+                if reprobe.account == nil || reprobe.account != identity.account {
+                    lastGood = nil
+                }
                 sessionToken = token
-                lastGood = nil
-                identity = identityReader()
+                identity = reprobe
             } else if case .unreachable = identity {
                 identity = identityReader()
             }
@@ -630,7 +635,15 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
 
     /// `claude auth status --json` gives both the plan and the signed-in address.
     private static func authStatus() -> AuthProbe {
-        guard let json = run("claude", ["auth", "status", "--json"]),
+        guard let executable = CLI.path("claude") else { return .unreachable }
+        return authStatus(executable: executable, environment: CLI.environment(for: "claude"))
+    }
+
+    static func authStatus(executable: String, environment: [String: String]? = nil) -> AuthProbe {
+        // A signed-out CLI returns valid status JSON with exit code 1.
+        guard case .success(let json) = CLI.run(executable: executable,
+                                               arguments: ["auth", "status", "--json"],
+                                               environment: environment, acceptedExitCodes: [0, 1]),
               let data = json.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return .unreachable }
