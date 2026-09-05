@@ -43,23 +43,31 @@ private struct RateLimitsPayload: Decodable {
     let rateLimitResetCredits: ResetCreditsSummary?
 }
 
-private struct AccountInfo: Decodable {
+private struct AccountInfo: Decodable, Equatable {
+    let type: String?
     let email: String?
+    let planType: String?
 }
 
 private struct AccountPayload: Decodable {
     let account: AccountInfo?
 }
 
-private struct AccountEnvelope: Decodable {
-    let result: AccountPayload?
+private struct RPCResult<Value: Decodable>: Decodable {
+    let result: Value
+}
+
+private struct InitializedPayload: Decodable {}
+
+private struct RPCError: Decodable {
+    let code: Int
+    let message: String
 }
 
 private struct RPCEnvelope: Decodable {
     let id: Int?
     let method: String?
-    let result: RateLimitsPayload?
-    let params: RateLimitsPayload?
+    let error: RPCError?
 }
 
 // MARK: - Provider
@@ -77,13 +85,27 @@ protocol UsageProviding: AnyObject, Sendable {
 /// `account/rateLimits/updated` push notifications, with a slow poll as a backstop.
 final class CodexProvider: @unchecked Sendable, UsageProviding {
     private let onUpdate: @Sendable (Result<UsageSource, Error>) -> Void
+    private let makeProcess: @Sendable () throws -> Process
+    private let requestTimeout: TimeInterval
+    private let pollInterval: TimeInterval
+    // Transport callbacks and all mutable provider state share this queue.
+    private let queue = DispatchQueue(label: "llm-usage.codex")
+    private let queueKey = DispatchSpecificKey<Void>()
+    private enum State { case starting, ready, failed, stopped }
+    private var state: State = .stopped
     private var process: Process?
     private var stdin: FileHandle?
     private var nextID = 1
-    private var cachedAccount: String?
-    private var lastGood: UsageSource?
-    private var stopping = false
-    private let lock = NSLock()
+    private var generation = 0
+    private var cachedAccount: AccountInfo?
+    private var publishedAccount: AccountInfo?
+    private var hasPublishedUsage = false
+    private var pollTimer: DispatchSourceTimer?
+    private struct PendingRequest {
+        let method: String
+        let timeout: DispatchWorkItem
+    }
+    private var pending: [Int: PendingRequest] = [:]
 
     /// A server we terminated on purpose is not a failure worth a red card.
     private struct ServerExited: LocalizedError {
@@ -91,144 +113,253 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
         var errorDescription: String? { "codex app-server exited (status \(status))" }
     }
 
-    private static let pollInterval: TimeInterval = 300
-
-    init(onUpdate: @escaping @Sendable (Result<UsageSource, Error>) -> Void) {
-        self.onUpdate = onUpdate
+    private struct RequestFailed: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
     }
 
-    func start() {
-        // Resolved rather than looked up through `env`: a bundle launched by launchd
-        // or Finder has only the system PATH, so `env codex` failed silently and left
-        // the card blank for every Homebrew install (see `CLI`).
-        guard let executable = CLI.path("codex") else {
-            // Metering Codex is optional, so this is a card that says what is missing,
-            // not an error (docs/design.md §6).
-            var source = UsageSource.placeholder(id: "codex", name: "Codex")
-            source.note = CLI.NotFound(tool: "codex").errorDescription
-            onUpdate(.success(source))
-            return
-        }
+    init(makeProcess: @escaping @Sendable () throws -> Process = CodexProvider.serverProcess,
+         requestTimeout: TimeInterval = 20,
+         pollInterval: TimeInterval = 300,
+         onUpdate: @escaping @Sendable (Result<UsageSource, Error>) -> Void) {
+        self.makeProcess = makeProcess
+        self.requestTimeout = requestTimeout
+        self.pollInterval = pollInterval
+        self.onUpdate = onUpdate
+        queue.setSpecific(key: queueKey, value: ())
+    }
 
+    deinit { stop() }
+
+    func start() {
+        queue.async { [self] in
+            guard state == .stopped else { return }
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + pollInterval, repeating: pollInterval)
+            timer.setEventHandler { [weak self] in self?.refreshOnQueue() }
+            pollTimer = timer
+            timer.resume()
+            connect()
+        }
+    }
+
+    private static func serverProcess() throws -> Process {
+        guard let executable = CLI.path("codex") else { throw CLI.NotFound(tool: "codex") }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = ["app-server"]
-        // An npm-installed `codex` is a script that has to find `node` itself.
-        proc.environment = CLI.environment()
+        proc.environment = CLI.environment(for: "codex")
+        return proc
+    }
 
+    private func connect() {
+        disconnect()
+        state = .starting
+        let currentGeneration = generation
+        let proc: Process
+        do {
+            proc = try makeProcess()
+        } catch let error as CLI.NotFound {
+            state = .failed
+            var source = UsageSource.placeholder(id: "codex", name: "Codex")
+            source.note = error.errorDescription
+            onUpdate(.success(source))
+            return
+        } catch {
+            fail(error)
+            return
+        }
         let inPipe = Pipe(), outPipe = Pipe()
+        // A server may exit between the running check and a write to its pipe.
+        _ = fcntl(inPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         proc.standardInput = inPipe
         proc.standardOutput = outPipe
-        // The binary prints a PATH-alias warning to stderr; stdout is the protocol.
         proc.standardError = FileHandle.nullDevice
-
-        // Without this the card just stays empty when the server dies on startup —
-        // the failure mode that hid the PATH problem in the first place.
         proc.terminationHandler = { [weak self] finished in
-            guard let self, !self.isStopping() else { return }
-            self.onUpdate(.failure(ServerExited(status: finished.terminationStatus)))
+            self?.queue.async { [weak self] in
+                guard let self, self.generation == currentGeneration else { return }
+                self.fail(ServerExited(status: finished.terminationStatus))
+            }
         }
-
         do {
             try proc.run()
         } catch {
-            onUpdate(.failure(error))
+            fail(error)
             return
         }
-
         process = proc
         stdin = inPipe.fileHandleForWriting
-
         let handle = outPipe.fileHandleForReading
-        Thread.detachNewThread { [weak self] in self?.readLoop(handle) }
-
+        let callbackQueue = queue
+        Thread.detachNewThread { [weak self] in
+            defer { try? handle.close() }
+            var buffer = Data()
+            while true {
+                // read(upToCount:) waits to fill its buffer on macOS pipes.
+                let chunk = handle.availableData
+                guard !chunk.isEmpty else { return }
+                buffer.append(chunk)
+                while let nl = buffer.firstIndex(of: 0x0A) {
+                    let line = Data(buffer[buffer.startIndex..<nl])
+                    buffer.removeSubrange(buffer.startIndex...nl)
+                    callbackQueue.async { [weak self] in
+                        guard let self, self.generation == currentGeneration else { return }
+                        self.dispatch(line: line)
+                    }
+                }
+            }
+        }
         send(method: "initialize", params: [
             "clientInfo": ["name": "llm-usage", "title": "LLM Usage", "version": "0.1.0"]
         ])
-        refresh()
-
-        Thread.detachNewThread { [weak self] in
-            while true {
-                Thread.sleep(forTimeInterval: Self.pollInterval)
-                guard let self, self.process?.isRunning == true else { return }
-                self.refresh()
-            }
-        }
     }
 
     func refresh() {
-        send(method: "account/rateLimits/read", params: nil)
-        if cachedAccount == nil { send(method: "account/read", params: [:]) }
+        queue.async { [weak self] in self?.refreshOnQueue() }
+    }
+
+    private func refreshOnQueue() {
+        switch state {
+        case .stopped, .starting: return
+        case .failed: connect()
+        case .ready:
+            guard process?.isRunning == true else { connect(); return }
+            guard pending.isEmpty else { return }
+            // Recheck identity before every snapshot so an external login cannot
+            // attach usage from one account to the previous account's address.
+            send(method: "account/read", params: [:])
+        }
     }
 
     func stop() {
-        lock.lock()
-        stopping = true
-        lock.unlock()
-        process?.terminate()
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            stopOnQueue()
+        } else {
+            queue.sync { stopOnQueue() }
+        }
+    }
+
+    private func stopOnQueue() {
+        state = .stopped
+        pollTimer?.cancel()
+        pollTimer = nil
+        disconnect()
+    }
+
+    private func disconnect() {
+        generation += 1
+        for request in pending.values { request.timeout.cancel() }
+        pending.removeAll()
+        cachedAccount = nil
+        try? stdin?.close()
+        stdin = nil
+        if let proc = process {
+            proc.terminationHandler = nil
+            if proc.isRunning {
+                proc.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                    if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+                }
+            }
+        }
         process = nil
     }
 
-    private func isStopping() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return stopping
+    private func fail(_ error: Error) {
+        disconnect()
+        state = .failed
+        onUpdate(.failure(error))
     }
 
     // MARK: - Transport
 
     private func send(method: String, params: [String: Any]?) {
-        lock.lock()
         let id = nextID
         nextID += 1
-        lock.unlock()
-
-        var payload: [String: Any] = ["jsonrpc": "2.0", "id": id, "method": method]
-        payload["params"] = params ?? NSNull()
-
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
-        var line = data
-        line.append(0x0A)
-        do {
-            try stdin?.write(contentsOf: line)
-        } catch {
-            onUpdate(.failure(error))
+        let currentGeneration = generation
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == currentGeneration, self.pending[id] != nil else { return }
+            self.fail(RequestFailed(message: "Codex \(method) timed out. Retry to reconnect."))
         }
+        pending[id] = PendingRequest(method: method, timeout: timeout)
+        queue.asyncAfter(deadline: .now() + requestTimeout, execute: timeout)
+        write(["id": id, "method": method, "params": params ?? NSNull()])
     }
 
-    private func readLoop(_ handle: FileHandle) {
-        var buffer = Data()
-        while true {
-            let chunk = handle.availableData
-            if chunk.isEmpty { break }
-            buffer.append(chunk)
-            while let nl = buffer.firstIndex(of: 0x0A) {
-                let line = Data(buffer[buffer.startIndex..<nl])
-                buffer.removeSubrange(buffer.startIndex...nl)
-                dispatch(line: line)
+    private func write(_ message: [String: Any]) {
+        do {
+            guard let stdin, process?.isRunning == true else {
+                throw RequestFailed(message: "Codex is disconnected. Retry to reconnect.")
             }
+            var payload = message
+            payload["jsonrpc"] = "2.0"
+            var line = try JSONSerialization.data(withJSONObject: payload)
+            line.append(0x0A)
+            try stdin.write(contentsOf: line)
+        } catch {
+            fail(error)
         }
     }
 
     private func dispatch(line: Data) {
-        // account/read carries the signed-in address; try it first, since the
-        // rate-limits shape would decode it as an empty result.
-        if let account = try? JSONDecoder().decode(AccountEnvelope.self, from: line),
-           let email = account.result?.account?.email, !email.isEmpty {
-            cachedAccount = email
-            if var previous = lastGood {
-                previous.account = email
-                onUpdate(.success(previous))
+        let decoder = JSONDecoder()
+        guard let envelope = try? decoder.decode(RPCEnvelope.self, from: line) else { return }
+        if envelope.id == nil {
+            guard state == .ready else { return }
+            switch envelope.method {
+            case "account/updated":
+                for request in pending.values { request.timeout.cancel() }
+                pending.removeAll()
+                cachedAccount = nil
+                if hasPublishedUsage {
+                    hasPublishedUsage = false
+                    onUpdate(.success(.placeholder(id: "codex", name: "Codex")))
+                }
+                refreshOnQueue()
+            case "account/rateLimits/updated":
+                // Pushes are sparse. Refetch a complete snapshot and its identity.
+                refreshOnQueue()
+            default: break
             }
             return
         }
-
-        guard let env = try? JSONDecoder().decode(RPCEnvelope.self, from: line) else { return }
-        // Either a reply to account/rateLimits/read, or an account/rateLimits/updated push.
-        guard let payload = env.result ?? env.params else { return }
-        var source = Self.normalise(payload)
-        source.account = cachedAccount
-        lastGood = source
-        onUpdate(.success(source))
+        guard let id = envelope.id, let request = pending.removeValue(forKey: id) else { return }
+        request.timeout.cancel()
+        if let error = envelope.error {
+            fail(RequestFailed(message: "Codex \(request.method) failed (\(error.code)): \(error.message)"))
+            return
+        }
+        do {
+            switch request.method {
+            case "initialize":
+                _ = try decoder.decode(RPCResult<InitializedPayload>.self, from: line)
+                write(["method": "initialized"])
+                guard state == .starting else { return }
+                state = .ready
+                refreshOnQueue()
+            case "account/read":
+                let account = try decoder.decode(RPCResult<AccountPayload>.self, from: line).result.account
+                if hasPublishedUsage, account != publishedAccount {
+                    hasPublishedUsage = false
+                    var source = UsageSource.placeholder(id: "codex", name: "Codex")
+                    source.account = account?.email
+                    source.plan = account?.planType?.capitalized
+                    onUpdate(.success(source))
+                }
+                cachedAccount = account
+                send(method: "account/rateLimits/read", params: nil)
+            case "account/rateLimits/read":
+                let payload = try decoder.decode(RPCResult<RateLimitsPayload>.self, from: line).result
+                var source = Self.normalise(payload)
+                source.account = cachedAccount?.email
+                publishedAccount = cachedAccount
+                hasPublishedUsage = true
+                onUpdate(.success(source))
+            default: break
+            }
+        } catch {
+            fail(RequestFailed(message: "Codex returned an invalid \(request.method) response."))
+        }
     }
 
     // MARK: - Normalisation
@@ -247,9 +378,11 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
         let extras = (payload.rateLimitsByLimitId ?? [:])
             .sorted { $0.key < $1.key }
             .filter { key, _ in key != snapshot.limitId }
-            .compactMap { key, snap in
-                window(snap.primary, id: "codex-\(key)",
-                       label: shortLabel(snap.limitName) ?? key)
+            .flatMap { key, snap in
+                [window(snap.primary, id: "codex-\(key)-primary",
+                        label: shortLabel(snap.limitName) ?? key),
+                 window(snap.secondary, id: "codex-\(key)-secondary",
+                        label: shortLabel(snap.limitName) ?? key)].compactMap { $0 }
             }
 
         source.windows = ([
@@ -291,9 +424,8 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
         guard let w else { return nil }
         return UsageWindow(
             id: id,
-            // A named limit identifies itself; appending "7d" only pushed it past
-            // the label column, and the reset column already dates it.
-            label: label ?? self.label(forMinutes: w.windowDurationMins),
+            label: [label, self.label(forMinutes: w.windowDurationMins)]
+                .compactMap { $0 }.joined(separator: " "),
             usedPercent: w.usedPercent,
             resetsAt: w.resetsAt.map { Date(timeIntervalSince1970: $0) },
             windowMinutes: w.windowDurationMins

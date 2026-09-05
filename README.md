@@ -41,6 +41,8 @@ says by how much. It works on all three sources.
 `agy`'s data is only reachable while `agy` is running. The app never pretends a
 stale number is current: the card dims, its header mark switches to an outline
 glyph instead of a severity shape, and it states how old the value is.
+The summary and menu bar use current samples only. The footer keeps the last successful
+sample time when a fetch fails.
 
 **Partial failure is normal.** One source going down leaves the other two
 displaying normally. Only the broken card looks broken.
@@ -122,6 +124,7 @@ make panel      # render the panel to PNGs (light and dark) and open them
 make icon       # render the menu bar artwork to PNGs and open them
 make dist       # build a universal .app and zip it, as the release workflow does
 make help       # list every target
+swift test      # isolated regressions; no real credentials or provider requests
 ```
 
 `make probe` is the fastest way to check the data plumbing — it exercises all
@@ -136,6 +139,14 @@ source     : Codex  plan=Pro  account=…  state=ok  updated=2s ago
 `make panel` matters more than it looks: the panel only appears when you click
 the menu bar, so overflow, truncation, and column misalignment are easy to miss
 by eye. It renders offscreen in both appearances so you can actually inspect them.
+
+Providers start when the app launches and stop when it quits. Reopening the panel does
+not start another fetch loop. The Homebrew service restarts crashes and respects Quit;
+use `brew services restart llm-usage` to start it again after quitting.
+
+`LLM_USAGE_CLAUDE_ENDPOINT` accepts only an HTTP(S) loopback URL for local fixtures.
+An override uses the fixed `llm-usage-test-token` and skips Keychain and account lookups.
+Other destinations are rejected before credentials are read.
 
 ## How it reads the data
 

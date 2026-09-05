@@ -45,45 +45,78 @@ final class AgyProvider: @unchecked Sendable, UsageProviding {
     private let onUpdate: @Sendable (UsageSource) -> Void
     private let logDirectory: String
     private let forcedPort: Int?
+    private let session: URLSession
 
     private var timer: DispatchSourceTimer?
+    private var isStarted = false
+    private var generation = 0
+    private var fetchTask: URLSessionDataTask?
     private var cachedPort: Int?
     private var lastGood: UsageSource?
-    /// Plans change rarely; fetched once and kept for the process lifetime.
     private var cachedPlan: String?
     private var cachedAccount: String?
     private let queue = DispatchQueue(label: "llm-usage.agy")
 
-    init(onUpdate: @escaping @Sendable (UsageSource) -> Void) {
+    init(
+        session: URLSession = .shared,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        onUpdate: @escaping @Sendable (UsageSource) -> Void
+    ) {
         self.onUpdate = onUpdate
-        let env = ProcessInfo.processInfo.environment
-        logDirectory = env["LLM_USAGE_AGY_LOG_DIR"]
+        self.session = session
+        logDirectory = environment["LLM_USAGE_AGY_LOG_DIR"]
             ?? NSString(string: "~/.gemini/antigravity-cli/log").expandingTildeInPath
-        forcedPort = env["LLM_USAGE_AGY_PORT"].flatMap(Int.init)
+        forcedPort = environment["LLM_USAGE_AGY_PORT"].flatMap(Int.init)
+            .flatMap { (1...65_535).contains($0) ? $0 : nil }
     }
 
     func start() {
-        refresh()
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
-        t.setEventHandler { [weak self] in self?.refresh() }
-        t.resume()
-        timer = t
+        queue.async { [weak self] in
+            guard let self, !self.isStarted else { return }
+            self.isStarted = true
+            self.generation += 1
+            let t = DispatchSource.makeTimerSource(queue: self.queue)
+            t.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
+            t.setEventHandler { [weak self] in self?.beginFetch() }
+            t.resume()
+            self.timer = t
+            self.beginFetch()
+        }
     }
 
     func refresh() {
+        queue.async { [weak self] in self?.beginFetch() }
+    }
+
+    private func beginFetch() {
+        guard isStarted, fetchTask == nil else { return }
         guard let port = forcedPort ?? cachedPort ?? discoverPort() else {
             emitUnavailable(reason: "Antigravity not running")
             return
         }
         cachedPort = port
-        if cachedPlan == nil || cachedAccount == nil { fetchIdentity(port: port) }
-        fetch(port: port)
+        fetchIdentity(port: port, generation: generation)
     }
 
     func stop() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.isStarted = false
+            self.generation += 1
+            self.timer?.cancel()
+            self.timer = nil
+            self.fetchTask?.cancel()
+            self.fetchTask = nil
+            self.cachedPort = nil
+            self.cachedPlan = nil
+            self.cachedAccount = nil
+            self.lastGood = nil
+        }
+    }
+
+    deinit {
         timer?.cancel()
-        timer = nil
+        fetchTask?.cancel()
     }
 
     // MARK: - Port discovery
@@ -164,58 +197,83 @@ final class AgyProvider: @unchecked Sendable, UsageProviding {
     ///
     /// `GetUserStatus` also carries per-model quota, but every model in a group
     /// repeats that group's figure, so it adds nothing over the summary call.
-    private func fetchIdentity(port: Int) {
-        guard let request = request(port: port, method: "GetUserStatus") else { return }
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            guard let self, let data,
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let status = root["userStatus"] as? [String: Any],
-                  let plan = (status["userTier"] as? [String: Any])?["name"] as? String,
-                  !plan.isEmpty
-            else { return }
-
-            self.cachedPlan = plan
-            self.cachedAccount = (status["email"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            // The quota reply may already have gone out without them.
-            if var previous = self.lastGood {
-                previous.plan = plan
-                previous.account = self.cachedAccount
-                self.onUpdate(previous)
-            }
-        }.resume()
-    }
-
-    private func fetch(port: Int) {
-        guard let request = request(port: port, method: "RetrieveUserQuotaSummary") else { return }
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+    private func fetchIdentity(port: Int, generation: Int) {
+        guard let request = request(port: port, method: "GetUserStatus") else {
+            emitUnavailable(reason: "Invalid Antigravity port")
+            return
+        }
+        fetchTask = session.dataTask(with: request) { [weak self] data, response, _ in
             guard let self else { return }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard status == 200, let data,
-                  let envelope = try? JSONDecoder().decode(AgyEnvelope.self, from: data) else {
-                // A dead port means agy exited; force rediscovery next time round.
-                self.cachedPort = nil
-                self.emitUnavailable(reason: status == 0
-                                     ? "Antigravity not running"
-                                     : "Unavailable (HTTP \(status))")
-                return
+            self.queue.async {
+                guard self.isStarted, self.generation == generation else { return }
+                self.fetchTask = nil
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard code == 200, let data,
+                      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let status = root["userStatus"] as? [String: Any] else {
+                    self.failedFetch(status: code)
+                    return
+                }
+
+                let account = (status["email"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                if self.lastGood?.account != account {
+                    self.lastGood = nil
+                }
+                self.cachedAccount = account
+                self.cachedPlan = ((status["userTier"] as? [String: Any])?["name"] as? String)
+                    .flatMap { $0.isEmpty ? nil : $0 }
+                // Confirm identity before quota so a new login never relabels
+                // the previous account's successful reading.
+                self.fetch(port: port, generation: generation)
             }
-            var source = Self.normalise(envelope.response)
-            source.plan = self.cachedPlan
-            source.account = self.cachedAccount
-            self.lastGood = source
-            self.onUpdate(source)
-        }.resume()
+        }
+        fetchTask?.resume()
     }
 
-    /// Keeps the last good reading on screen and lets it age into `.stale`
-    /// rather than blanking the card whenever agy is closed.
+    private func fetch(port: Int, generation: Int) {
+        guard let request = request(port: port, method: "RetrieveUserQuotaSummary") else {
+            emitUnavailable(reason: "Invalid Antigravity port")
+            return
+        }
+
+        fetchTask = session.dataTask(with: request) { [weak self] data, response, _ in
+            guard let self else { return }
+            self.queue.async {
+                guard self.isStarted, self.generation == generation else { return }
+                self.fetchTask = nil
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard status == 200, let data,
+                      let envelope = try? JSONDecoder().decode(AgyEnvelope.self, from: data) else {
+                    self.failedFetch(status: status)
+                    return
+                }
+                var source = Self.normalise(envelope.response)
+                source.plan = self.cachedPlan
+                source.account = self.cachedAccount
+                self.lastGood = source
+                self.onUpdate(source)
+            }
+        }
+        fetchTask?.resume()
+    }
+
+    private func failedFetch(status: Int) {
+        cachedPort = nil
+        emitUnavailable(reason: status == 0 ? "Antigravity not running"
+                        : status == 200 ? "Unexpected Antigravity response"
+                        : "Unavailable (HTTP \(status))")
+    }
+
+    /// Retains the last successful sample and its timestamp as explicitly stale.
     private func emitUnavailable(reason: String) {
         if var previous = lastGood {
             previous.note = reason
+            previous.state = previous.lastUpdated.map { .stale(since: $0) } ?? .error(reason)
             onUpdate(previous)
         } else {
             var placeholder = UsageSource.placeholder(id: "agy", name: "Antigravity")
+            placeholder.plan = cachedPlan
+            placeholder.account = cachedAccount
             placeholder.note = reason
             onUpdate(placeholder)
         }

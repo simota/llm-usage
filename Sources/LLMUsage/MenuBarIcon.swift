@@ -35,6 +35,7 @@ enum MenuBarIcon {
                 // read as present rather than as a missing bar.
                 rounded(NSRect(x: x, y: baseline, width: barWidth, height: barHeight), alpha: 0.25)
 
+                guard source.hasCurrentData() else { continue }
                 let fraction = clamp((source.worstWindow?.usedPercent ?? 0) / 100)
                 rounded(NSRect(x: x, y: baseline,
                                width: barWidth,

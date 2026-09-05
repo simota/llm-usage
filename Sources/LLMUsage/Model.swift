@@ -21,8 +21,7 @@ struct UsageWindow: Identifiable, Sendable, Equatable {
     var isUnused: Bool { usedPercent < 0.5 }
 
     /// Linear extrapolation to the end of the window: >100 means the limit
-    /// arrives before the reset does. This is what "which one bites first"
-    /// actually depends on — a high percentage late in a window is fine.
+    /// arrives before the reset does. Compare exhaustion dates across durations.
     func projectedPercent(now: Date = Date()) -> Double {
         guard let elapsed = elapsedFraction(now: now), elapsed >= 0.1 else { return usedPercent }
         return min(usedPercent / elapsed, 999)
@@ -31,7 +30,9 @@ struct UsageWindow: Identifiable, Sendable, Equatable {
     /// When the current burn rate reaches 100%, if that happens before the
     /// window resets. nil means the allowance outlasts the window.
     func projectedExhaustion(now: Date = Date()) -> Date? {
+        if usedPercent >= 100 { return now }
         guard let resetsAt, let windowMinutes, windowMinutes > 0,
+              resetsAt > now,
               let elapsed = elapsedFraction(now: now), elapsed >= 0.1,
               usedPercent > 0 else { return nil }
 
@@ -43,6 +44,21 @@ struct UsageWindow: Identifiable, Sendable, Equatable {
 
         let span = Double(windowMinutes) * 60
         return resetsAt.addingTimeInterval(-span).addingTimeInterval(fractionAtLimit * span)
+    }
+
+    func exhaustsBefore(_ other: UsageWindow, now: Date) -> Bool {
+        let first = projectedExhaustion(now: now) ?? .distantFuture
+        let second = other.projectedExhaustion(now: now) ?? .distantFuture
+        if first != second { return first < second }
+        if isActive != other.isActive { return isActive }
+        if usedPercent != other.usedPercent { return usedPercent > other.usedPercent }
+        return id < other.id
+    }
+
+    var displayedSeverity: Severity { displayedSeverity(now: Date()) }
+
+    func displayedSeverity(now: Date) -> Severity {
+        Severity.escalated(Severity(usedPercent: usedPercent), paceDelta: paceDelta(now: now))
     }
 
     /// Where the pace tick sits: how far through the window we are, 0...1.
@@ -118,9 +134,17 @@ struct UsageSource: Identifiable, Sendable, Equatable {
     /// Re-evaluates `.ok` against `staleAfter`. Errors and placeholders are left alone.
     func agedState(now: Date = Date()) -> SourceState {
         guard case .ok = state, let lastUpdated else { return state }
-        return now.timeIntervalSince(lastUpdated) > staleAfter
+        let rolledOver = windows.contains { window in
+            guard let reset = window.resetsAt else { return false }
+            return reset <= now && lastUpdated < reset
+        }
+        return now.timeIntervalSince(lastUpdated) > staleAfter || rolledOver
             ? .stale(since: lastUpdated)
             : .ok
+    }
+
+    func hasCurrentData(now: Date = Date()) -> Bool {
+        lastUpdated != nil && !windows.isEmpty && agedState(now: now) == .ok
     }
 
     static func placeholder(id: String, name: String) -> UsageSource {
@@ -143,6 +167,11 @@ enum Severity: Int, Sendable, Comparable {
     }
 
     static func < (a: Severity, b: Severity) -> Bool { a.rawValue < b.rawValue }
+
+    static func escalated(_ base: Severity, paceDelta: Double?) -> Severity {
+        guard let paceDelta, paceDelta > Format.overPaceThreshold else { return base }
+        return Swift.max(base, .critical)
+    }
 }
 
 // MARK: - Formatting
