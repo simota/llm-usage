@@ -15,9 +15,9 @@
 class LlmUsage < Formula
   desc "Menu bar app tracking Claude Code, Codex CLI and Antigravity usage limits"
   homepage "https://github.com/simota/llm-usage"
-  url "https://github.com/simota/llm-usage/releases/download/v0.2.2/LLMUsage-0.2.2.zip"
-  version "0.2.2"
-  sha256 "9582f89297d3d37b08dfb91f4b446b5fe9496fb506108c949ad5b0c4ff5ea56b"
+  url "https://github.com/simota/llm-usage/releases/download/v0.2.3/LLMUsage-0.2.3.zip"
+  version "0.2.3"
+  sha256 "d86be1663e3deedc769f1329c130de7dc8c81bb51299dc553885d5df6b67fa2a"
 
   # Matches LSMinimumSystemVersion in packaging/Info.plist.
   depends_on macos: :ventura
