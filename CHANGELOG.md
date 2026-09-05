@@ -13,6 +13,35 @@ agree.
 
 Nothing yet.
 
+## [0.2.3] - 2026-09-05
+
+### Fixed
+
+- Usage polling starts when the app launches, without waiting for the panel to
+  open. Reopening the panel or refreshing repeatedly no longer starts duplicate
+  requests, and quitting cancels pending work.
+- Codex waits for initialization before reading usage, reports request failures,
+  reconnects after a timeout or server exit, and displays both windows for
+  additional limits.
+- Account changes discard the previous account's usage. Claude Code logout is
+  recognized even when its status command returns exit code 1, while token
+  renewal for the same account preserves the last successful reading if the next
+  fetch fails.
+- Failed Claude Code and Antigravity fetches keep the last successful values
+  explicitly marked as stale, with their original timestamps. Claude Code's
+  retry deadline also applies to manual refreshes.
+- Summaries and menu bar warnings use current data only, including after a usage
+  window resets. The binding limit is the one predicted to run out first, and
+  the footer shows the last successful sample time.
+- CLI tools inherit the runtime path used to find them. Subprocess reads have
+  bounded time and output, so a stalled command cannot hold up polling forever.
+- The Homebrew service restarts crashes and respects Quit.
+
+### Changed
+
+- `LLM_USAGE_CLAUDE_ENDPOINT` accepts only HTTP(S) loopback URLs and uses fixture
+  credentials, keeping real credentials out of local endpoint tests.
+
 ## [0.2.2] - 2026-08-24
 
 ### Fixed
@@ -203,7 +232,8 @@ The first release. Everything below is new.
 - No automated tests yet, and CI runs only on tags — nothing verifies a build on
   push or pull request.
 
-[Unreleased]: https://github.com/simota/llm-usage/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/simota/llm-usage/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/simota/llm-usage/releases/tag/v0.2.3
 [0.2.2]: https://github.com/simota/llm-usage/releases/tag/v0.2.2
 [0.2.1]: https://github.com/simota/llm-usage/releases/tag/v0.2.1
 [0.2.0]: https://github.com/simota/llm-usage/releases/tag/v0.2.0
