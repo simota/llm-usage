@@ -130,6 +130,7 @@ enum CLI {
 
     enum RunFailure: Error, Equatable {
         case notRun
+        case cancelled
         case timedOut
         case exitCode(Int32)
         case outputTooLarge
@@ -140,7 +141,9 @@ enum CLI {
     static func run(executable: String, arguments: [String],
                     environment: [String: String]? = nil,
                     timeout: TimeInterval = 10,
-                    acceptedExitCodes: Set<Int32> = [0]) -> Result<String, RunFailure> {
+                    acceptedExitCodes: Set<Int32> = [0],
+                    isCancelled: @Sendable () -> Bool = { false }) -> Result<String, RunFailure> {
+        guard !isCancelled() else { return .failure(.cancelled) }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -165,6 +168,10 @@ enum CLI {
         var buffer = [UInt8](repeating: 0, count: 8_192)
         var failure: RunFailure?
         while true {
+            if isCancelled() {
+                failure = .cancelled
+                break
+            }
             if ProcessInfo.processInfo.systemUptime >= deadline {
                 failure = .timedOut
                 break

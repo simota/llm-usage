@@ -37,8 +37,8 @@ track to hit the limit early. Every gauge carries a `▽` marker at the window's
 elapsed fraction — when the fill passes the tick, you are over-pace, and the row
 says by how much. It works on all three sources.
 
-**Staleness is visible.** Claude Code's token goes stale while it sits idle, and
-`agy`'s data is only reachable while `agy` is running. The app never pretends a
+**Staleness is visible.** Claude Code's token can expire, and Antigravity's usage
+command can fail or time out. The app never pretends a
 stale number is current: the card dims, its header mark switches to an outline
 glyph instead of a severity shape, and it states how old the value is.
 The summary and menu bar use current samples only. The footer keeps the last successful
@@ -57,7 +57,7 @@ displaying normally. Only the broken card looks broken.
 |---|---|---|
 | Codex | `codex` on `PATH` | Runs `codex app-server` as a child process and reads its push notifications |
 | Claude Code | A Claude Code login; `claude` on `PATH` for the plan and account | Reads the `Claude Code-credentials` keychain item **read-only**, through the same `/usr/bin/security` Claude Code writes it with, so macOS does not prompt |
-| Antigravity | `agy` running | Talks to the language server `agy` starts on localhost. No auth needed, but the port closes when `agy` exits |
+| Antigravity | Logged-in `agy` 1.1.11+ on `PATH` | Runs the read-only `/usage` command; the interactive CLI does not need to be open |
 
 ## Install
 
@@ -150,16 +150,22 @@ Other destinations are rejected before credentials are read.
 
 ## How it reads the data
 
-Nothing is scraped from a terminal and nothing leaves your machine.
+Nothing is scraped from a terminal. Each source uses its CLI or usage API.
 
 | Source | Path | Official? |
 |---|---|---|
 | Codex | `codex app-server` JSON-RPC `account/rateLimits/read` | Official — the schema can be machine-generated |
 | Claude Code | `GET https://api.anthropic.com/api/oauth/usage` with the keychain token | Unofficial; an official API is [not planned](https://github.com/anthropics/claude-code/issues/45392) |
-| Antigravity | `RetrieveUserQuotaSummary` on `agy`'s local language server | Internal protocol, but confined to localhost |
+| Antigravity | `agy -p /usage --output-format json` | Supported read-only command since agy 1.1.11; no model turn or token usage |
 
 All three are polled every 300 seconds. Codex also receives push updates, so it
 stays current on its own.
+
+Antigravity's CLI handles its own authentication. Older or unrecognized versions
+are rejected before `/usage` runs, since older versions can interpret it as a
+model prompt. The structured result supplies every quota window but no account
+or plan, so those labels are omitted. The previous `LLM_USAGE_AGY_PORT` and
+`LLM_USAGE_AGY_LOG_DIR` overrides are no longer used.
 
 **Claude Code's token is never refreshed.** The refresh token rotates
 server-side, so refreshing it from here would break your Claude Code login. The
@@ -173,7 +179,7 @@ to this build's signature alone and be denied, and prompt, after the next
 rebuild. Nothing extra is granted: the access-list entry is Claude Code's own,
 and the token comes back on a pipe rather than in an argument list.
 
-Because two of the three paths are unofficial, a CLI update can break them.
+Because CLI output and unofficial APIs can change, an update can break a source.
 Each source degrades on its own rather than taking the app down.
 
 ## Docs

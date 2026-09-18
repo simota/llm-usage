@@ -70,6 +70,26 @@ final class CLITests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(start), 1.5)
     }
 
+    func testCancelledCommandIsNotLaunched() {
+        let result = CLI.run(executable: "/does/not/exist", arguments: [], isCancelled: { true })
+        XCTAssertEqual(result, .failure(.cancelled))
+    }
+
+    func testCancellationTerminatesRunningProcessThatIgnoresTerm() throws {
+        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let start = Date()
+        let result = CLI.run(executable: "/bin/sh", arguments: ["-c",
+            "trap '' TERM; echo $$ > '\(pidFile.path)'; while :; do :; done"],
+            timeout: 5, isCancelled: { FileManager.default.fileExists(atPath: pidFile.path) })
+        XCTAssertEqual(result, .failure(.cancelled))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.5)
+        let pid = try XCTUnwrap(Int32(String(contentsOf: pidFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
     func testDescendantHoldingStdoutDoesNotBlockCompletedCommand() throws {
         let start = Date()
         let output = try CLI.run(executable: "/bin/sh", arguments: ["-c", "sleep 1 & printf done"], timeout: 0.3).get()

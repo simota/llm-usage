@@ -390,7 +390,7 @@ Thresholds for calling something stale (they differ per source):
 |---|---|---|
 | Codex | 10 min | Shouldn't go stale at all, since there are push notifications |
 | Claude Code | 15 min | OAuth polls every 300 seconds. Unobtainable while the token is expired |
-| agy | 15 min | **Unobtainable while agy is closed** (the local language server dies). Shown as stale for the duration |
+| agy | 15 min | Polls the read-only CLI usage command every 300 seconds; no open interactive session required |
 
 ### Active window (`is_active`)
 
@@ -405,9 +405,10 @@ Putting a dot in the label column was rejected: it squeezed the 64pt column and 
 The tick alone doesn't convey what it means. On rows where `paceDelta > +10%`, attach
 `⚠ +27% over pace` in red. Red is unified across the tick, the row caption, and the summary-line icon.
 
-When agy is stopped, treat it as **stale, not error**. From the user's point of view it is only
-"not updated because I'm not using agy" — not a failure.
-Attach `Antigravity not running` as the annotation.
+When agy's usage command fails, keep the last successful reading explicitly
+stale with its original timestamp and an actionable error note. Missing or
+outdated CLIs have no current reading. The command does not return an account
+or plan, so the Antigravity card leaves those labels absent.
 
 ### Legend
 

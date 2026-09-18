@@ -1,73 +1,76 @@
 import Foundation
 
-// MARK: - Wire types
-//
-// Shape recorded in docs/feasibility.md §3. Note the two inversions relative to
-// the other providers: this reports what is *left*, not what is used, and its
-// reset times are RFC3339 strings rather than epoch seconds.
-
+// The read-only /usage command returns structured quota data in command.data.
+// Fractions represent what remains, and reset times are RFC3339 strings.
 private struct AgyBucket: Decodable {
-    let bucketId: String?
-    let displayName: String?
-    let description: String?
-    let window: String?
+    let id: String
+    let window: String
     let remainingFraction: Double?
     let resetTime: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, window
+        case remainingFraction = "remaining_fraction"
+        case resetTime = "reset_time"
+    }
 }
 
 private struct AgyGroup: Decodable {
-    let displayName: String?
-    let description: String?
-    let buckets: [AgyBucket]?
+    let name: String
+    let buckets: [AgyBucket]
 }
 
 private struct AgyQuotaSummary: Decodable {
-    let groups: [AgyGroup]?
+    let groups: [AgyGroup]
 }
 
 private struct AgyEnvelope: Decodable {
-    let response: AgyQuotaSummary
+    let status: String
+    let num_turns: Int
+    let command: Command
+
+    struct Command: Decodable {
+        let name: String
+        let data: AgyQuotaSummary
+    }
 }
 
-// MARK: - Provider
-
-/// Talks to the language server that agy starts on localhost.
-///
-/// This needs no credentials: agy has already authenticated, and we are asking
-/// its own process. The cost is that data only exists while agy runs — when it
-/// exits the port closes, which surfaces as staleness rather than as an error
-/// (docs/design.md §6).
+/// Asks agy for usage through its read-only print command. The CLI owns login
+/// and local-server authentication; no session credentials are read here.
 final class AgyProvider: @unchecked Sendable, UsageProviding {
-    private static let service = "exa.language_server_pb.LanguageServerService"
+    typealias CommandRunner = @Sendable (
+        String, [String], [String: String], TimeInterval, @Sendable () -> Bool
+    ) -> Result<String, CLI.RunFailure>
+
     private static let pollInterval: TimeInterval = 300
     private static let windowMinutes = ["5h": 300, "weekly": 10_080]
-
     private let onUpdate: @Sendable (UsageSource) -> Void
-    private let logDirectory: String
-    private let forcedPort: Int?
-    private let session: URLSession
-
+    private let resolveCLI: @Sendable () -> CLI.Resolution?
+    private let runCommand: CommandRunner
+    private let queue = DispatchQueue(label: "llm-usage.agy")
+    private let queueKey = DispatchSpecificKey<Void>()
     private var timer: DispatchSourceTimer?
     private var isStarted = false
     private var generation = 0
-    private var fetchTask: URLSessionDataTask?
-    private var cachedPort: Int?
+    private var cancellation: Mutex<Bool>?
+    private var fetchFinished: DispatchGroup?
     private var lastGood: UsageSource?
-    private var cachedPlan: String?
-    private var cachedAccount: String?
-    private let queue = DispatchQueue(label: "llm-usage.agy")
 
     init(
-        session: URLSession = .shared,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
+        resolveCLI: @escaping @Sendable () -> CLI.Resolution? = {
+            guard let path = CLI.path("agy") else { return nil }
+            return CLI.Resolution(path: path, environment: CLI.environment(for: "agy"))
+        },
+        runCommand: @escaping CommandRunner = { path, arguments, environment, timeout, isCancelled in
+            CLI.run(executable: path, arguments: arguments, environment: environment,
+                    timeout: timeout, isCancelled: isCancelled)
+        },
         onUpdate: @escaping @Sendable (UsageSource) -> Void
     ) {
         self.onUpdate = onUpdate
-        self.session = session
-        logDirectory = environment["LLM_USAGE_AGY_LOG_DIR"]
-            ?? NSString(string: "~/.gemini/antigravity-cli/log").expandingTildeInPath
-        forcedPort = environment["LLM_USAGE_AGY_PORT"].flatMap(Int.init)
-            .flatMap { (1...65_535).contains($0) ? $0 : nil }
+        self.resolveCLI = resolveCLI
+        self.runCommand = runCommand
+        queue.setSpecific(key: queueKey, value: ())
     }
 
     func start() {
@@ -75,11 +78,11 @@ final class AgyProvider: @unchecked Sendable, UsageProviding {
             guard let self, !self.isStarted else { return }
             self.isStarted = true
             self.generation += 1
-            let t = DispatchSource.makeTimerSource(queue: self.queue)
-            t.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
-            t.setEventHandler { [weak self] in self?.beginFetch() }
-            t.resume()
-            self.timer = t
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
+            timer.setEventHandler { [weak self] in self?.beginFetch() }
+            timer.resume()
+            self.timer = timer
             self.beginFetch()
         }
     }
@@ -89,182 +92,106 @@ final class AgyProvider: @unchecked Sendable, UsageProviding {
     }
 
     private func beginFetch() {
-        guard isStarted, fetchTask == nil else { return }
-        guard let port = forcedPort ?? cachedPort ?? discoverPort() else {
-            emitUnavailable(reason: "Antigravity not running")
-            return
+        guard isStarted, cancellation == nil else { return }
+        let cancelled = Mutex(false)
+        cancellation = cancelled
+        let finished = DispatchGroup()
+        finished.enter()
+        fetchFinished = finished
+        let generation = generation
+        let resolveCLI = resolveCLI
+        let runCommand = runCommand
+        let queue = queue
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Self.readUsage(resolveCLI: resolveCLI, runCommand: runCommand,
+                                        isCancelled: { cancelled.withLock { $0 } })
+            finished.leave()
+            queue.async { [weak self] in
+                guard let self, self.isStarted, self.generation == generation else { return }
+                self.cancellation = nil
+                self.fetchFinished = nil
+                switch result {
+                case .success(let source):
+                    self.lastGood = source
+                    self.onUpdate(source)
+                case .failure(let failure):
+                    self.emitUnavailable(reason: failure.rawValue)
+                }
+            }
         }
-        cachedPort = port
-        fetchIdentity(port: port, generation: generation)
     }
 
     func stop() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.isStarted = false
-            self.generation += 1
-            self.timer?.cancel()
-            self.timer = nil
-            self.fetchTask?.cancel()
-            self.fetchTask = nil
-            self.cachedPort = nil
-            self.cachedPlan = nil
-            self.cachedAccount = nil
-            self.lastGood = nil
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            stopOnQueue()
+        } else {
+            queue.sync { stopOnQueue() }
         }
     }
 
-    deinit {
+    private func stopOnQueue() {
+        isStarted = false
+        generation += 1
         timer?.cancel()
-        fetchTask?.cancel()
+        timer = nil
+        cancellation?.withLock { $0 = true }
+        // App termination follows stop(), so let CLI.run reap its child first.
+        // A stalled resolver must not prevent the application from quitting.
+        _ = fetchFinished?.wait(timeout: .now() + 1)
+        cancellation = nil
+        fetchFinished = nil
+        lastGood = nil
     }
 
-    // MARK: - Port discovery
+    deinit { stop() }
 
-    /// The language server binds a fresh random port per session and only
-    /// announces it in the log, so this is the only way to find it.
-    private func discoverPort() -> Int? {
-        let fm = FileManager.default
-
-        // cli.log is agy's symlink to the active session log. Its startup line
-        // is near the beginning, so avoid metadata-walking every archived log
-        // and decoding a potentially very large active log on the cold path.
-        let cliLog = ((logDirectory as NSString).deletingLastPathComponent as NSString)
-            .appendingPathComponent("cli.log")
-        if let text = Self.logPrefix(at: cliLog), let port = Self.lastHTTPPort(in: text) {
-            return port
-        }
-
-        // Preserve the old discovery path when the symlink is absent, broken,
-        // or has an unexpected log format.
-        guard let names = try? fm.contentsOfDirectory(atPath: logDirectory) else { return nil }
-
-        let newest = names
-            .filter { $0.hasPrefix("cli-") && $0.hasSuffix(".log") }
-            .map { (logDirectory as NSString).appendingPathComponent($0) }
-            .compactMap { path -> (String, Date)? in
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let date = attrs[.modificationDate] as? Date else { return nil }
-                return (path, date)
-            }
-            .max { $0.1 < $1.1 }?.0
-
-        guard let newest, let text = try? String(contentsOfFile: newest, encoding: .utf8) else {
-            return nil
-        }
-        return Self.lastHTTPPort(in: text)
+    private enum FetchFailure: String, Error {
+        case missing = "agy not found (install Antigravity CLI)"
+        case outdated = "Update Antigravity CLI (agy 1.1.11+ required)"
+        case failed = "Antigravity unavailable (check agy /usage and login)"
+        case timedOut = "Antigravity usage request timed out"
+        case unexpected = "Unexpected Antigravity response (update agy)"
     }
 
-    private static func logPrefix(at path: String, byteLimit: Int = 64 * 1024) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
-            return nil
+    private static func readUsage(
+        resolveCLI: @Sendable () -> CLI.Resolution?, runCommand: CommandRunner,
+        isCancelled: @escaping @Sendable () -> Bool
+    ) -> Result<UsageSource, FetchFailure> {
+        guard !isCancelled() else { return .failure(.failed) }
+        guard let cli = resolveCLI() else { return .failure(.missing) }
+        // Older releases can treat /usage as a model prompt in print mode.
+        // Check support before invoking it, including after a CLI downgrade.
+        let version = runCommand(cli.path, ["--version"], cli.environment, 3, isCancelled)
+        guard case .success(let text) = version else {
+            return .failure(version == .failure(.timedOut) ? .timedOut : .failed)
         }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: byteLimit), !data.isEmpty else {
-            return nil
+        guard supportsUsageCommand(version: text) else { return .failure(.outdated) }
+        guard !isCancelled() else { return .failure(.failed) }
+        let output = runCommand(cli.path, ["-p", "/usage", "--output-format", "json",
+                                          "--print-timeout", "10s"], cli.environment, 10, isCancelled)
+        guard case .success(let json) = output else {
+            return .failure(output == .failure(.timedOut) ? .timedOut : .failed)
         }
-        return String(data: data, encoding: .utf8)
+        guard let envelope = try? JSONDecoder().decode(AgyEnvelope.self, from: Data(json.utf8)),
+              envelope.status == "SUCCESS", envelope.num_turns == 0,
+              envelope.command.name == "usage",
+              envelope.command.data.groups.allSatisfy({ group in
+                  group.buckets.allSatisfy { bucket in
+                      !bucket.id.isEmpty && (bucket.remainingFraction.map { $0.isFinite && (0...1).contains($0) } ?? true)
+                  }
+              }) else { return .failure(.unexpected) }
+        return .success(normalise(envelope.command.data))
     }
 
-    static func lastHTTPPort(in log: String) -> Int? {
-        let pattern = #"listening on random port at (\d+) for HTTP\b"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let range = NSRange(log.startIndex..., in: log)
-        guard let match = regex.matches(in: log, range: range).last,
-              let portRange = Range(match.range(at: 1), in: log) else { return nil }
-        return Int(log[portRange])
+    static func supportsUsageCommand(version: String) -> Bool {
+        let text = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }),
+              let major = Int(parts[0]), let minor = Int(parts[1]), let patch = Int(parts[2])
+        else { return false }
+        return major > 1 || (major == 1 && (minor > 1 || (minor == 1 && patch >= 11)))
     }
 
-    // MARK: - Fetch
-
-    private func request(port: Int, method: String) -> URLRequest? {
-        guard let url = URL(string: "http://localhost:\(port)/\(Self.service)/\(method)")
-        else { return nil }
-        var request = URLRequest(url: url, timeoutInterval: 10)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
-        request.httpBody = Data("{}".utf8)
-        return request
-    }
-
-    /// The plan and the signed-in address both come from here. The plan is
-    /// `userTier.name` ("Google AI Ultra"), not from
-    /// `planStatus.planInfo.planName`. Those are different axes: planName is the
-    /// Antigravity/Windsurf-lineage seat tier and reads "Pro" even for a Google
-    /// AI Ultra subscriber, which understates the account. No fallback to it —
-    /// a blank badge beats a wrong one.
-    ///
-    /// `GetUserStatus` also carries per-model quota, but every model in a group
-    /// repeats that group's figure, so it adds nothing over the summary call.
-    private func fetchIdentity(port: Int, generation: Int) {
-        guard let request = request(port: port, method: "GetUserStatus") else {
-            emitUnavailable(reason: "Invalid Antigravity port")
-            return
-        }
-        fetchTask = session.dataTask(with: request) { [weak self] data, response, _ in
-            guard let self else { return }
-            self.queue.async {
-                guard self.isStarted, self.generation == generation else { return }
-                self.fetchTask = nil
-                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-                guard code == 200, let data,
-                      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let status = root["userStatus"] as? [String: Any] else {
-                    self.failedFetch(status: code)
-                    return
-                }
-
-                let account = (status["email"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                if self.lastGood?.account != account {
-                    self.lastGood = nil
-                }
-                self.cachedAccount = account
-                self.cachedPlan = ((status["userTier"] as? [String: Any])?["name"] as? String)
-                    .flatMap { $0.isEmpty ? nil : $0 }
-                // Confirm identity before quota so a new login never relabels
-                // the previous account's successful reading.
-                self.fetch(port: port, generation: generation)
-            }
-        }
-        fetchTask?.resume()
-    }
-
-    private func fetch(port: Int, generation: Int) {
-        guard let request = request(port: port, method: "RetrieveUserQuotaSummary") else {
-            emitUnavailable(reason: "Invalid Antigravity port")
-            return
-        }
-
-        fetchTask = session.dataTask(with: request) { [weak self] data, response, _ in
-            guard let self else { return }
-            self.queue.async {
-                guard self.isStarted, self.generation == generation else { return }
-                self.fetchTask = nil
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                guard status == 200, let data,
-                      let envelope = try? JSONDecoder().decode(AgyEnvelope.self, from: data) else {
-                    self.failedFetch(status: status)
-                    return
-                }
-                var source = Self.normalise(envelope.response)
-                source.plan = self.cachedPlan
-                source.account = self.cachedAccount
-                self.lastGood = source
-                self.onUpdate(source)
-            }
-        }
-        fetchTask?.resume()
-    }
-
-    private func failedFetch(status: Int) {
-        cachedPort = nil
-        emitUnavailable(reason: status == 0 ? "Antigravity not running"
-                        : status == 200 ? "Unexpected Antigravity response"
-                        : "Unavailable (HTTP \(status))")
-    }
-
-    /// Retains the last successful sample and its timestamp as explicitly stale.
     private func emitUnavailable(reason: String) {
         if var previous = lastGood {
             previous.note = reason
@@ -272,14 +199,10 @@ final class AgyProvider: @unchecked Sendable, UsageProviding {
             onUpdate(previous)
         } else {
             var placeholder = UsageSource.placeholder(id: "agy", name: "Antigravity")
-            placeholder.plan = cachedPlan
-            placeholder.account = cachedAccount
             placeholder.note = reason
             onUpdate(placeholder)
         }
     }
-
-    // MARK: - Normalisation
 
     private static func normalise(_ summary: AgyQuotaSummary) -> UsageSource {
         var source = UsageSource(id: "agy", displayName: "Antigravity")
@@ -287,53 +210,29 @@ final class AgyProvider: @unchecked Sendable, UsageProviding {
         source.lastUpdated = Date()
         source.state = .ok
         source.note = "Shared with the desktop app and SDK"
-
-        // Every window, in a stable order — never "the worst one per group".
-        // That made a row's meaning change under the reader: Gemini's row was
-        // the 5h limit while it was busy and silently became the weekly one
-        // after it reset. Unused windows collapse to a single line in the view,
-        // so showing them all costs little.
-        source.windows = (summary.groups ?? []).flatMap { group -> [UsageWindow] in
-            let short = shortName(group.displayName)
-            return (group.buckets ?? [])
-                .compactMap { window($0, group: short) }
-                .sorted { rank($0) < rank($1) }
+        // /usage does not identify the account or plan. Keep both absent rather
+        // than attaching an identity from another session to this snapshot.
+        source.windows = summary.groups.flatMap { group -> [UsageWindow] in
+            let short = shortName(group.name)
+            return group.buckets.compactMap { window($0, group: short) }
+                .sorted { ($0.windowMinutes ?? Int.max) < ($1.windowMinutes ?? Int.max) }
         }
-        // The windows now carry everything the buckets did.
-        source.buckets = []
         return source
-    }
-
-    /// Shorter windows first, matching Claude's 5h-then-7d ordering.
-    private static func rank(_ window: UsageWindow) -> Int {
-        window.windowMinutes ?? Int.max
     }
 
     private static func window(_ bucket: AgyBucket, group: String) -> UsageWindow? {
         guard let remaining = bucket.remainingFraction else { return nil }
-        let windowKey = bucket.window ?? ""
+        let label = bucket.window == "weekly" ? "7d" : bucket.window.isEmpty ? "—" : bucket.window
         return UsageWindow(
-            id: bucket.bucketId ?? "\(group)-\(windowKey)",
-            label: "\(group) \(windowLabel(windowKey))",
-            usedPercent: (1 - remaining) * 100,
+            id: bucket.id, label: "\(group) \(label)", usedPercent: (1 - remaining) * 100,
             resetsAt: bucket.resetTime.flatMap(parseTimestamp),
-            // Unknown window strings leave this nil, which suppresses the pace
-            // tick rather than inventing a duration.
-            windowMinutes: windowMinutes[windowKey]
+            windowMinutes: windowMinutes[bucket.window]
         )
     }
 
-    private static func windowLabel(_ window: String) -> String {
-        switch window {
-        case "5h": return "5h"
-        case "weekly": return "7d"
-        default: return window.isEmpty ? "—" : window
-        }
-    }
-
-    /// "Gemini Models" -> "Gemini", "Claude and GPT models" -> "Claude/GPT".
-    private static func shortName(_ displayName: String?) -> String {
-        guard var name = displayName, !name.isEmpty else { return "—" }
+    private static func shortName(_ displayName: String) -> String {
+        guard !displayName.isEmpty else { return "—" }
+        var name = displayName
         for suffix in [" Models", " models"] where name.hasSuffix(suffix) {
             name.removeLast(suffix.count)
         }

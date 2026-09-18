@@ -11,7 +11,19 @@ agree.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- Antigravity usage no longer fails with HTTP 401 when its local server requires
+  a CSRF token. Read quotas through `agy -p /usage --output-format json` instead,
+  with bounded execution and cancellation when the app stops.
+
+### Changed
+
+- Antigravity requires a logged-in CLI version 1.1.11 or later, but no open
+  interactive session. Older or unknown versions are rejected before running
+  `/usage` to avoid sending it as a model prompt. Account and plan labels are
+  omitted because the command does not return them. The old Antigravity port
+  and log-directory environment overrides no longer apply.
 
 ## [0.2.3] - 2026-09-05
 

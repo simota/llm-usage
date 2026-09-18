@@ -54,7 +54,7 @@ class LlmUsage < Formula
 
       Each source authenticates on its own: Claude Code needs a login (the app
       reads its keychain item read-only, with no prompt), Codex needs
-      ~/.codex/auth.json, and Antigravity needs `agy` running.
+      ~/.codex/auth.json, and Antigravity needs a logged-in `agy` 1.1.11 or later.
     EOS
   end
 

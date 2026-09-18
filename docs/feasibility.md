@@ -4,6 +4,19 @@
 **Scope**: A native macOS menu-bar app that displays the usage (limits) of Claude Code / Codex CLI / Antigravity CLI (agy)
 **Verdict**: **Feasible (GO)**
 
+> **Antigravity update (2026-09-18):** The no-auth localhost path documented
+> below is historical. An active agy 1.2.5 server returned HTTP 401 with
+> `missing CSRF token`. The provider now uses the supported
+> `agy -p /usage --output-format json` command, introduced in 1.1.11
+> ([official changelog](https://antigravity.google/changelog)). Live verification
+> returned `status: SUCCESS`, `num_turns: 0`, zero tokens, and all four windows.
+> Data is in `command.data.groups`, with group `name` and bucket `id`, `window`,
+> `remaining_fraction`, and `reset_time`. The CLI handles authentication;
+> the app reads no Antigravity credentials. No open interactive session is
+> required. Account and plan are not in the result. Version checks prevent
+> older CLIs from interpreting `/usage` as a model prompt. Previous log/port
+> discovery and the associated environment overrides have been removed.
+
 CLI versions at the time of investigation:
 
 | CLI | Version | Path |

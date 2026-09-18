@@ -373,7 +373,7 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
         case .failure(.exitCode(let code)):
             return .failure(failure(forExit: code))
         case .failure(.timedOut): return .failure(.timedOut)
-        case .failure(.notRun): return .failure(.notRun)
+        case .failure(.notRun), .failure(.cancelled): return .failure(.notRun)
         case .failure(.outputTooLarge): return .failure(.outputTooLarge)
         }
     }
