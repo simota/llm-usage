@@ -11,6 +11,10 @@ agree.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.4] - 2026-09-19
+
 ### Fixed
 
 - Antigravity usage no longer fails with HTTP 401 when its local server requires
