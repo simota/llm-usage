@@ -108,6 +108,12 @@ while True:
   (`codex_bengalfox`) has its own `resetsAt` and `windowDurationMins`, separate from the main limit.
   Collapsing it into a percent-only bucket loses the reset time and hides it at 0%, so treat it as a window.
   The display name is the last element of `limitName` (`GPT-5.3-Codex-Spark` → `Spark`) — the full string does not fit the label column
+- **Fields added by 2026-10 (codex-cli 0.162.1, re-captured 2026-10-14):** top-level `ordinaryUsageAllowed`
+  (null = unknown; the schema says not to infer recovery from percentages, so `false` is shown as-is), and per
+  snapshot `rateLimitReachedType`, `spendControlReached`, `individualLimit` (`used` / `limit` decimal strings,
+  `remainingPercent`, `resetsAt`) and `normalModelSlug`. `account/rateLimits/read` now takes optional params;
+  `excludeResetCreditDetails: true` skips the separate per-credit lookup and returns `credits: null` with the count.
+  On that date the main limit was a single 7d `primary` (`secondary: null`) and the Spark entry was gone
 - **An `account/rateLimits/updated` push notification** exists, so a resident process can update passively with no polling
 - `account/read` → `{"account":{"type":"chatgpt","email":"…","planType":"pro"}}` gives the account
 - `account/usage/read` returns **statistics, not limits** (`lifetimeTokens` / `peakDailyTokens` /

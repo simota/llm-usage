@@ -11,7 +11,14 @@ agree.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- Codex follows the current `account/rateLimits/read` schema (codex-cli 0.162):
+  a blocked account (`ordinaryUsageAllowed: false` / `rateLimitReachedType`)
+  leads the card note, a workspace spend control (`individualLimit`) shows as a
+  Spend row, and underscored plan types read as words.
+- Codex background reads pass `excludeResetCreditDetails` once the free-reset
+  rows are known, and ask for them again only when the count changes.
 
 ## [0.2.4] - 2026-09-19
 

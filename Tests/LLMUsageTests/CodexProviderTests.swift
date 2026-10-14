@@ -185,6 +185,61 @@ final class CodexProviderTests: XCTestCase {
         XCTAssertEqual(secondAccount.last?.windows.first?.usedPercent, 10)
     }
 
+    func testBlockedUsageSpendControlAndPlanAreSurfaced() {
+        let received = expectation(description: "blocked snapshot")
+        let samples = Mutex<[UsageSource]>([])
+        let script = Self.server(usage: #"""
+            printf '{"id":%s,"result":%s}\n' "$id" '{"ordinaryUsageAllowed":false,"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":10080},"planType":"self_serve_business_usage_based","rateLimitReachedType":"workspace_member_credits_depleted","individualLimit":{"limit":"200.0000","used":"150.5000","remainingPercent":25,"resetsAt":2000000000}}}'
+            continue
+            """#)
+        let provider = CodexProvider(makeProcess: { Self.process(script) }) { result in
+            guard case .success(let source) = result, source.state == .ok else { return }
+            samples.withLock { $0.append(source) }
+            received.fulfill()
+        }
+        provider.start()
+        wait(for: [received], timeout: 3)
+        provider.stop()
+        let source = samples.withLock { $0.first }
+        XCTAssertEqual(source?.plan, "Self Serve Business Usage Based")
+        XCTAssertEqual(source?.note, "Workspace credits depleted")
+        XCTAssertEqual(source?.spend?.usedPercent, 75)
+        XCTAssertEqual(source?.spend?.detail,
+                       "\(150.5.formatted(.number.precision(.fractionLength(0...2)))) / 200")
+    }
+
+    func testResetCreditRowsAreReusedWhileTheCountMatches() {
+        let first = expectation(description: "detailed read")
+        let second = expectation(description: "count-only read")
+        let samples = Mutex<[UsageSource]>([])
+        // usedPercent echoes whether the request skipped the detail lookup.
+        let script = Self.server(usage: #"""
+            reads=$((reads + 1))
+            case "$line" in *excludeResetCreditDetails*) used=2 ;; *) used=1 ;; esac
+            if [ "$reads" -eq 1 ]; then credits='[{"id":"a","resetType":"codexRateLimits","status":"available","grantedAt":1,"expiresAt":4000000000}]'; else credits=null; fi
+            printf '{"id":%s,"result":{"rateLimits":{"primary":{"usedPercent":%s,"windowDurationMins":10080}},"rateLimitResetCredits":{"availableCount":1,"credits":%s}}}\n' "$id" "$used" "$credits"
+            continue
+            """#)
+        let provider = CodexProvider(makeProcess: { Self.process(script) }) { result in
+            guard case .success(let source) = result, source.state == .ok else { return }
+            samples.withLock { $0.append(source) }
+            switch source.windows.first?.usedPercent {
+            case 1: first.fulfill()
+            case 2: second.fulfill()
+            default: break
+            }
+        }
+        provider.start()
+        wait(for: [first], timeout: 3)
+        provider.refresh()
+        wait(for: [second], timeout: 3)
+        provider.stop()
+        let notes = samples.withLock { $0.map(\.note) }
+        XCTAssertEqual(notes.count, 2)
+        XCTAssertEqual(notes.first, notes.last)
+        XCTAssertTrue(notes.last??.contains("first expires") == true)
+    }
+
     func testUnknownResponseIDCannotPublishSnapshot() {
         let received = expectation(description: "only matching response accepted")
         let samples = Mutex<[UsageSource]>([])

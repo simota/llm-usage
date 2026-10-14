@@ -17,6 +17,13 @@ private struct CreditsSnapshot: Decodable {
     let balance: String?
 }
 
+/// A workspace spend control on this member. Amounts arrive as decimal strings.
+private struct SpendControlLimit: Decodable {
+    let limit: String?
+    let used: String?
+    let remainingPercent: Double?
+}
+
 private struct RateLimitSnapshot: Decodable {
     let limitId: String?
     let limitName: String?
@@ -24,6 +31,8 @@ private struct RateLimitSnapshot: Decodable {
     let secondary: RateLimitWindow?
     let credits: CreditsSnapshot?
     let planType: String?
+    let individualLimit: SpendControlLimit?
+    let rateLimitReachedType: String?
 }
 
 /// A free "Full reset" grant that can be spent to clear the rate limit early.
@@ -41,6 +50,9 @@ private struct RateLimitsPayload: Decodable {
     let rateLimits: RateLimitSnapshot
     let rateLimitsByLimitId: [String: RateLimitSnapshot]?
     let rateLimitResetCredits: ResetCreditsSummary?
+    /// Null means unknown. The schema forbids inferring recovery from the
+    /// percentages, so `false` is reported as-is even when they look low.
+    let ordinaryUsageAllowed: Bool?
 }
 
 private struct AccountInfo: Decodable, Equatable {
@@ -100,6 +112,10 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
     private var cachedAccount: AccountInfo?
     private var publishedAccount: AccountInfo?
     private var hasPublishedUsage = false
+    /// The per-credit rows cost the backend a separate lookup, so they are asked
+    /// for only when the count has no matching rows on hand.
+    private var resetDetails: ResetCreditsSummary?
+    private var needsResetDetails = true
     private var pollTimer: DispatchSourceTimer?
     private struct PendingRequest {
         let method: String
@@ -251,6 +267,8 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
         for request in pending.values { request.timeout.cancel() }
         pending.removeAll()
         cachedAccount = nil
+        resetDetails = nil
+        needsResetDetails = true
         try? stdin?.close()
         stdin = nil
         if let proc = process {
@@ -311,6 +329,8 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
                 for request in pending.values { request.timeout.cancel() }
                 pending.removeAll()
                 cachedAccount = nil
+                resetDetails = nil
+                needsResetDetails = true
                 if hasPublishedUsage {
                     hasPublishedUsage = false
                     onUpdate(.success(.placeholder(id: "codex", name: "Codex")))
@@ -343,14 +363,17 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
                     hasPublishedUsage = false
                     var source = UsageSource.placeholder(id: "codex", name: "Codex")
                     source.account = account?.email
-                    source.plan = account?.planType?.capitalized
+                    source.plan = Self.planName(account?.planType)
                     onUpdate(.success(source))
+                    resetDetails = nil
+                    needsResetDetails = true
                 }
                 cachedAccount = account
-                send(method: "account/rateLimits/read", params: nil)
+                send(method: "account/rateLimits/read",
+                     params: needsResetDetails ? nil : ["excludeResetCreditDetails": true])
             case "account/rateLimits/read":
                 let payload = try decoder.decode(RPCResult<RateLimitsPayload>.self, from: line).result
-                var source = Self.normalise(payload)
+                var source = Self.normalise(payload, resets: resetCredits(payload.rateLimitResetCredits))
                 source.account = cachedAccount?.email
                 publishedAccount = cachedAccount
                 hasPublishedUsage = true
@@ -362,12 +385,27 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
         }
     }
 
+    /// A summary without rows reuses the last rows while the count still matches;
+    /// otherwise the next read asks for them again.
+    private func resetCredits(_ summary: ResetCreditsSummary?) -> ResetCreditsSummary? {
+        if summary?.credits != nil {
+            resetDetails = summary
+        } else if let cached = resetDetails, cached.availableCount == summary?.availableCount {
+            return cached
+        } else {
+            resetDetails = nil
+        }
+        needsResetDetails = resetDetails == nil && (summary?.availableCount ?? 0) > 0
+        return resetDetails ?? summary
+    }
+
     // MARK: - Normalisation
 
-    private static func normalise(_ payload: RateLimitsPayload) -> UsageSource {
+    private static func normalise(_ payload: RateLimitsPayload,
+                                  resets: ResetCreditsSummary?) -> UsageSource {
         let snapshot = payload.rateLimits
         var source = UsageSource(id: "codex", displayName: "Codex")
-        source.plan = snapshot.planType?.capitalized
+        source.plan = planName(snapshot.planType)
         source.staleAfter = 600
         source.lastUpdated = Date()
         source.state = .ok
@@ -390,13 +428,51 @@ final class CodexProvider: @unchecked Sendable, UsageProviding {
             window(snapshot.secondary, id: "codex-secondary"),
         ].compactMap { $0 }) + extras
 
-        source.note = notes(snapshot: snapshot, resets: payload.rateLimitResetCredits)
+        source.spend = spendRow(snapshot.individualLimit)
+        source.note = notes(snapshot: snapshot, resets: resets,
+                            usageAllowed: payload.ordinaryUsageAllowed)
         return source
     }
 
+    /// "pro" -> "Pro", "self_serve_business_usage_based" -> "Self Serve Business Usage Based".
+    private static func planName(_ type: String?) -> String? {
+        type.map { $0.replacingOccurrences(of: "_", with: " ").capitalized }
+    }
+
+    private static func spendRow(_ limit: SpendControlLimit?) -> UsageSpend? {
+        guard let limit, let remaining = limit.remainingPercent else { return nil }
+        return UsageSpend(label: "Spend", usedPercent: 100 - remaining,
+                          detail: [limit.used, limit.limit].compactMap { $0.map(amount) }
+                              .joined(separator: " / "))
+    }
+
+    /// "58716.3917850000" -> "58,716.39".
+    private static func amount(_ value: String) -> String {
+        guard let number = Double(value) else { return value }
+        return number.formatted(.number.precision(.fractionLength(0...2)))
+    }
+
+    /// Why ordinary usage is blocked, when the server says it is.
+    private static func blockedReason(_ type: String?, usageAllowed: Bool?) -> String? {
+        switch type {
+        case "rate_limit_reached": return "Limit reached"
+        case "workspace_owner_credits_depleted", "workspace_member_credits_depleted":
+            return "Workspace credits depleted"
+        case "workspace_owner_usage_limit_reached", "workspace_member_usage_limit_reached":
+            return "Workspace usage limit reached"
+        default: return usageAllowed == false ? "Usage blocked" : nil
+        }
+    }
+
     private static func notes(snapshot: RateLimitSnapshot,
-                              resets: ResetCreditsSummary?) -> String? {
+                              resets: ResetCreditsSummary?,
+                              usageAllowed: Bool?) -> String? {
         var parts: [String] = []
+
+        // Leads the line: it overrides whatever the percentages suggest.
+        if let blocked = blockedReason(snapshot.rateLimitReachedType, usageAllowed: usageAllowed) {
+            parts.append(blocked)
+        }
 
         // Free rate-limit resets: the most actionable thing on this card when the
         // weekly limit is running hot, and they expire.
