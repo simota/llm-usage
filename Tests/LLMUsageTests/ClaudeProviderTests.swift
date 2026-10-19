@@ -287,6 +287,69 @@ final class ClaudeProviderTests: XCTestCase {
         }
     }
 
+    func testAuthStatusLabelsOnlyAClaudeAiLogin() throws {
+        let executable = try authStatusFixture()
+        defer { try? FileManager.default.removeItem(at: executable) }
+        let cases: [(json: String, account: String?)] = [
+            (#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","email":"web@example.test"}"#, "web@example.test"),
+            (#"{"loggedIn":true,"authMethod":"api_key","email":"key@example.test"}"#, nil),
+            // An older CLI without the field keeps its previous meaning.
+            (#"{"loggedIn":true,"subscriptionType":"pro","email":"old@example.test"}"#, "old@example.test"),
+        ]
+        for (json, account) in cases {
+            let probe = ClaudeProvider.authStatus(executable: executable.path,
+                                                  environment: ["FIXTURE_AUTH_JSON": json, "FIXTURE_AUTH_EXIT": "0"])
+            guard case .answered = probe else {
+                XCTFail("Expected an answered probe for \(json)")
+                continue
+            }
+            XCTAssertEqual(probe.account, account, json)
+            if account == nil { XCTAssertNil(probe.plan, json) }
+        }
+    }
+
+    func testUsageFromKeychainTokenIsNotLabelledWithAnotherCredentialsAccount() throws {
+        let executable = try authStatusFixture()
+        defer { try? FileManager.default.removeItem(at: executable) }
+        let environment = ["FIXTURE_AUTH_JSON": #"{"loggedIn":true,"authMethod":"api_key","email":"key@example.test"}"#,
+                           "FIXTURE_AUTH_EXIT": "0"]
+        let harness = ClaudeHTTPHarness()
+        let updates = Mutex<[UsageSource]>([])
+        let provider = makeProvider(harness, updates: updates,
+                                    identity: { ClaudeProvider.authStatus(executable: executable.path, environment: environment) })
+        defer { provider.stop() }
+        provider.start()
+        try awaitCount(harness, 1)
+        harness.respond(0, status: 200)
+        try awaitUpdates(updates, 1)
+        let source = try XCTUnwrap(updates.withLock { $0.last })
+        XCTAssertEqual(source.state, .ok)
+        XCTAssertNil(source.account)
+        XCTAssertNil(source.plan)
+    }
+
+    func testParseReadsTheClaudeCodeKeychainShape() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let live = #"{"claudeAiOauth":{"accessToken":"fixture-token","expiresAt":1000001}}"#
+        guard case .token("fixture-token") = ClaudeProvider.parse(live, now: now) else {
+            return XCTFail("Expected the access token")
+        }
+        // expiresAt is milliseconds: exactly now is already expired.
+        guard case .expired = ClaudeProvider.parse(#"{"claudeAiOauth":{"accessToken":"t","expiresAt":1000000}}"#, now: now) else {
+            return XCTFail("Expected expiry at the millisecond boundary")
+        }
+        guard case .token = ClaudeProvider.parse(#"{"claudeAiOauth":{"accessToken":"t"}}"#, now: now) else {
+            return XCTFail("A token without expiresAt is used as is")
+        }
+        for malformed in ["", "not json", #"{"accessToken":"t"}"#,
+                          #"{"claudeAiOauth":{"accessToken":""}}"#, #"{"claudeAiOauth":{}}"#] {
+            guard case .malformed = ClaudeProvider.parse(malformed, now: now) else {
+                XCTFail("Expected malformed for \(malformed)")
+                continue
+            }
+        }
+    }
+
     func testEndpointOverrideUsesOnlyMockCredential() throws {
         let harness = ClaudeHTTPHarness()
         let reads = Mutex(0)
