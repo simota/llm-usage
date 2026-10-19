@@ -410,6 +410,13 @@ stale with its original timestamp and an actionable error note. Missing or
 outdated CLIs have no current reading. The command does not return an account
 or plan, so the Antigravity card leaves those labels absent.
 
+This makes Antigravity the one exception to "account changes discard the
+previous account's usage": nothing the app can read reveals an agy account
+switch, so a fetch that fails right after one still shows the previous
+account's last reading, stale and dimmed. No address is attached to it, so it
+is never labelled as the new account's; it is replaced by the first successful
+fetch and cleared when the app stops.
+
 ### Legend
 
 A first run cannot learn what a hollow triangle over a bar means from the panel alone — nothing in
