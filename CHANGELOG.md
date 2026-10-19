@@ -11,6 +11,10 @@ agree.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.6] - 2026-10-20
+
 ### Fixed
 
 - The Claude Code card no longer labels usage with an address from a different
@@ -275,7 +279,8 @@ The first release. Everything below is new.
 - No automated tests yet, and CI runs only on tags — nothing verifies a build on
   push or pull request.
 
-[Unreleased]: https://github.com/simota/llm-usage/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/simota/llm-usage/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/simota/llm-usage/releases/tag/v0.2.6
 [0.2.5]: https://github.com/simota/llm-usage/releases/tag/v0.2.5
 [0.2.4]: https://github.com/simota/llm-usage/releases/tag/v0.2.4
 [0.2.3]: https://github.com/simota/llm-usage/releases/tag/v0.2.3
