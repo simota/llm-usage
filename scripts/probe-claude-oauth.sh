@@ -24,14 +24,14 @@ printf '%s' "$raw" | jq '
   walk(redact)
 ' 2>/dev/null || echo "(not JSON — inspect manually)"
 
-token=$(printf '%s' "$raw" | jq -r '
-  .claudeAiOauth.accessToken // .accessToken // .access_token // empty
-' 2>/dev/null)
+# The same path ClaudeProvider.parse accepts, and no other: if the token has moved,
+# the app reports "Credential format not recognised", and so must this probe.
+token=$(printf '%s' "$raw" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
 
 if [[ -z "$token" ]]; then
   echo >&2
-  echo "no access token found at a known path. Adjust the jq filter using the" >&2
-  echo "shape printed above, then re-run." >&2
+  echo "no token at .claudeAiOauth.accessToken — the format the app reads has changed." >&2
+  echo "Compare the shape printed above with ClaudeProvider.parse." >&2
   exit 1
 fi
 
@@ -39,6 +39,9 @@ version=$(claude --version 2>/dev/null | awk '{print $1}')
 
 echo
 echo "--- GET /api/oauth/usage (User-Agent: claude-code/$version) ---"
-curl -sS -w '\nHTTP %{http_code}\n' https://api.anthropic.com/api/oauth/usage \
-  -H "Authorization: Bearer $token" \
-  -H "User-Agent: claude-code/$version" | jq . 2>/dev/null || true
+# The header goes in on stdin (printf is a builtin), so the token never sits in
+# curl's argument list where `ps` would show it.
+printf 'Authorization: Bearer %s\n' "$token" |
+  curl -sS -w '\nHTTP %{http_code}\n' https://api.anthropic.com/api/oauth/usage \
+    -H @- \
+    -H "User-Agent: claude-code/$version" | jq . 2>/dev/null || true
