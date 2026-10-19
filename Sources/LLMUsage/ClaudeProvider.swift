@@ -311,15 +311,20 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
     /// Matched by service alone, as the in-process query was: the account is the login
     /// name today, and there is nothing to gain from pinning a second attribute.
     private static func credential() -> Credential {
-        let output: String
         switch securityRead() {
         case .failure(.keychain(errSecItemNotFound)):
             return .missing
         case .failure(let failure):
             return .unreadable(failure)
         case .success(let text):
-            output = text
+            return parse(text, now: Date())
         }
+    }
+
+    /// The Keychain payload is Claude Code's format, not ours: this is the one place that
+    /// knows it (`scripts/probe-claude-oauth.sh` reads the same path), so a change on its
+    /// side shows up here as `.malformed` and in the tests that pin the shape.
+    static func parse(_ output: String, now: Date) -> Credential {
         guard let data = output.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = root["claudeAiOauth"] as? [String: Any],
@@ -328,7 +333,7 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
 
         // expiresAt is milliseconds since epoch.
         if let expiresAt = oauth["expiresAt"] as? Double,
-           Date().timeIntervalSince1970 * 1000 >= expiresAt {
+           now.timeIntervalSince1970 * 1000 >= expiresAt {
             return .expired
         }
         return .token(token)
@@ -648,6 +653,14 @@ final class ClaudeProvider: @unchecked Sendable, UsageProviding {
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return .unreachable }
 
+        // The token comes from the Keychain item a claude.ai login writes, while this answer
+        // comes from whatever credential the CLI resolved. Under any other method (an API key,
+        // a token from the environment) the address belongs to a different credential, so it
+        // must not label usage fetched with the Keychain token. An older CLI that omits the
+        // field is taken at its word, as before.
+        if let method = root["authMethod"] as? String, method != "claude.ai" {
+            return .answered(plan: nil, account: nil)
+        }
         let plan = (root["subscriptionType"] as? String).flatMap { type -> String? in
             type.isEmpty ? nil : type.prefix(1).uppercased() + type.dropFirst()
         }

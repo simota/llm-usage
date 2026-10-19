@@ -11,7 +11,23 @@ agree.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- The Claude Code card no longer labels usage with an address from a different
+  credential. The usage comes from the Keychain token a claude.ai login writes,
+  but the account came from whatever `claude auth status` resolved; when that
+  reports any other `authMethod` (an API key, a token from the environment),
+  the card now leaves plan and account blank instead of naming the wrong login.
+- The Keychain payload is parsed in one place, `ClaudeProvider.parse`, against
+  the injected clock, and its shape and millisecond expiry are pinned by tests.
+- `scripts/probe-claude-oauth.sh` accepts only the token path the app reads, so
+  it reports a format change instead of masking it, and passes the
+  `Authorization` header to `curl` on stdin rather than in its arguments.
+
+### Documentation
+
+- `docs/design.md` records Antigravity as the one source where an account
+  change cannot discard the previous reading, since `/usage` names no account.
 
 ## [0.2.5] - 2026-10-14
 
