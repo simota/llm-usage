@@ -11,7 +11,15 @@ agree.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Linux support: a tray app in `linux/`, written in Rust with gpui. It ports
+  the three providers, the normalised model, the pace and severity rules, and
+  the panel, and reads Claude Code's token from `~/.claude/.credentials.json`.
+  The tray icon is a StatusNotifierItem; the panel runs as a short-lived child
+  process because gpui ends its event loop when the last window closes.
+  `make install` in `linux/` adds a menu entry and an autostart entry. CI
+  builds, lints and tests it on Ubuntu.
 
 ## [0.2.6] - 2026-10-20
 
