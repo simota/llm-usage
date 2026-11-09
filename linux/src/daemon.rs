@@ -13,6 +13,7 @@ use jiff::Timestamp;
 
 use crate::icon::TrayArt;
 use crate::ipc::{FromPanel, ToPanel, write_line};
+use crate::menu::{self, Line};
 use crate::model::UsageSource;
 use crate::provider::UsageProvider;
 use crate::store::UsageStore;
@@ -41,7 +42,7 @@ struct Daemon {
     store: UsageStore,
     providers: Vec<Box<dyn UsageProvider>>,
     tray: Option<ksni::blocking::Handle<Tray>>,
-    published: Option<(TrayArt, String)>,
+    published: Option<(TrayArt, String, Vec<Line>)>,
     panel: Option<PanelChild>,
     panel_closed_at: Option<Instant>,
 }
@@ -78,6 +79,7 @@ pub fn run(open_panel: bool) {
         Tray {
             art: TrayArt::from_sources(&store.sources, None, false, now),
             summary: store.summary(now).text,
+            lines: menu::lines(&store, now),
             events: Mutex::new(events.clone()),
         }
         .spawn()
@@ -198,15 +200,22 @@ impl Daemon {
             self.store.shows_worst_figure,
             now,
         );
-        let next = (art, self.store.summary(now).text);
+        // The menu's relative times ("12s ago", "in 48m") move with the clock,
+        // so the 30-second tick republishes them as well as every update.
+        let next = (
+            art,
+            self.store.summary(now).text,
+            menu::lines(&self.store, now),
+        );
         if self.published.as_ref() == Some(&next) {
             return;
         }
         if let Some(tray) = &self.tray {
-            let (art, summary) = next.clone();
+            let (art, summary, lines) = next.clone();
             tray.update(move |tray| {
                 tray.art = art;
                 tray.summary = summary;
+                tray.lines = lines;
             });
         }
         self.published = Some(next);

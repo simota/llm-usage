@@ -20,6 +20,16 @@ agree.
   process because gpui ends its event loop when the last window closes.
   `make install` in `linux/` adds a menu entry and an autostart entry. CI
   builds, lints and tests it on Ubuntu.
+- The Linux tray menu shows every source's usage, so a single click on GNOME —
+  which opens the menu rather than activating the item — shows it without
+  going through Open Panel. Each row's icon carries the colour a label cannot:
+  a usage ring in the severity hue with the pace tick, and the card marks.
+
+### Fixed
+
+- The Linux tray icon no longer disappears when a gauge fill lands on a
+  rounding edge: the rounded-rect test could hand `clamp` crossed bounds, which
+  panicked the tray thread.
 
 ## [0.2.6] - 2026-10-20
 

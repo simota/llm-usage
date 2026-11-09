@@ -236,6 +236,11 @@ pub fn dump(directory: &str) -> std::io::Result<()> {
             println!("{path}  {size}x{size}px");
         }
     }
+    for (name, row_icon) in crate::menu_icon::samples() {
+        let path = format!("{directory}/{name}.png");
+        std::fs::write(&path, crate::menu_icon::render(&row_icon))?;
+        println!("{path}  32x32px");
+    }
     Ok(())
 }
 
