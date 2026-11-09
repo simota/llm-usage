@@ -1,6 +1,7 @@
 # LLM Usage
 
-A macOS menu bar app that shows how much of your Claude Code, Codex CLI, and
+A macOS menu bar app — and a Linux tray app, built with Rust and gpui
+([below](#linux)) — that shows how much of your Claude Code, Codex CLI, and
 Antigravity CLI (`agy`) usage limits you have burned through — and whether you
 are burning through them too fast.
 
@@ -102,6 +103,57 @@ make install PREFIX=$HOME/Applications
 > as macOS is concerned. The keychain read goes through `/usr/bin/security` for
 > exactly that reason, and no longer asks for access after a rebuild.
 
+## Linux
+
+[`linux/`](linux) is the same app for Linux desktops, written in Rust with
+[gpui](https://crates.io/crates/gpui). The providers, the normalised model, the
+pace and severity rules, and the panel are ports of the Swift sources, and the
+panel follows the same design spec.
+
+It needs a desktop that hosts StatusNotifierItem tray icons — KDE Plasma, XFCE,
+Cinnamon, or GNOME with the AppIndicator extension (on by default in Ubuntu).
+Without one, the panel opens as a window at launch and closing it quits.
+
+```sh
+cd linux
+make install     # ~/.local/bin/llm-usage, a menu entry, and an autostart entry
+make uninstall
+```
+
+`PREFIX=` changes the install prefix and `AUTOSTART=0` skips the login item.
+Building needs a Rust 1.88+ toolchain plus the xcb and xkbcommon headers
+(`libxcb1-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev` on Debian
+and Ubuntu).
+
+```sh
+make            # build, replace any running instance, start detached
+make probe      # print every source's normalised usage, no GUI
+make demo       # the panel on fixed data: FIXTURE=baseline|states|severity
+make icon       # render the tray artwork to PNGs
+make test       # unit tests; no real credentials or provider requests
+make lint       # rustfmt and clippy, warnings as errors
+```
+
+What differs from macOS, and why:
+
+- **Claude Code's token comes from `~/.claude/.credentials.json`**
+  (`$CLAUDE_CONFIG_DIR/.credentials.json` when set). It is where Claude Code
+  stores its login on Linux, in the same shape as the macOS keychain item. The
+  file is only read, and the token is never refreshed, for the same reason as
+  on macOS.
+- **The tray icon is square and single-colour.** Tray hosts draw icons square,
+  so the three bars and the hot-figure mode are laid out in a square. There is
+  no template rendering, so the artwork is light for the usual dark panel;
+  `LLM_USAGE_TRAY_THEME=dark` draws it dark for a light panel.
+- **The panel is a separate process.** gpui ends its event loop when its last
+  window closes, so a single process cannot keep the tray alive with the panel
+  closed. The tray daemon owns the providers and holds no window. Clicking the
+  icon starts `llm-usage --panel-view`, which draws what the daemon sends it
+  and exits when it closes. As on macOS, the panel closes when it loses focus.
+- **Placing the panel is up to the compositor.** Wayland does not let a client
+  place a window beside the tray icon, so the panel opens where the
+  compositor puts new windows.
+
 ## Release
 
 Tagging is the whole process. [`.github/workflows/release.yml`](.github/workflows/release.yml)
@@ -186,3 +238,4 @@ Each source degrades on its own rather than taking the app down.
 
 - [`docs/design.md`](docs/design.md) — the UI design spec, and the reasoning behind each decision
 - [`docs/feasibility.md`](docs/feasibility.md) — how each data path was found, what was measured, and which paths were abandoned
+- [`linux/`](linux) — the Linux port (Rust + gpui); its module docs map each file to the Swift source it ports
