@@ -87,8 +87,11 @@ fn inside_rounded(fx: f32, fy: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> b
     if fx < x || fy < y || fx > x + w || fy > y + h {
         return false;
     }
-    let cx = fx.clamp(x + r, x + w - r);
-    let cy = fy.clamp(y + r, y + h - r);
+    // With r = w/2, `x + r` and `x + w - r` should be equal but can differ in
+    // the last bit, and `clamp` panics when its bounds cross. The core of the
+    // shape is never narrower than nothing.
+    let cx = fx.clamp(x + r, (x + w - r).max(x + r));
+    let cy = fy.clamp(y + r, (y + h - r).max(y + r));
     (fx - cx).powi(2) + (fy - cy).powi(2) <= r * r
 }
 
@@ -251,6 +254,22 @@ mod tests {
         let high = coverage(&TrayArt::Bars(vec![Some(90.0), Some(90.0), Some(90.0)]), 22);
         assert!(empty > 0.0);
         assert!(empty < low && low < high);
+    }
+
+    #[test]
+    fn every_size_and_fill_renders_without_panicking() {
+        // A fill height of 18.095 once put the rounded rect's clamp bounds a
+        // bit apart in the wrong order and took the tray thread down.
+        for size in [22usize, 32, 48, 64] {
+            for tenth in 0..=1000 {
+                let used = tenth as f64 / 10.0;
+                render(
+                    &TrayArt::Bars(vec![Some(used), Some(100.0 - used), None]),
+                    size,
+                );
+                render(&TrayArt::Figure(used), size);
+            }
+        }
     }
 
     #[test]
