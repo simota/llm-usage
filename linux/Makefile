@@ -3,6 +3,8 @@
 # `make` builds and (re)starts it. The app lives in the system tray and has no
 # window until you click it, so `run` detaches and returns.
 
+# rustup's default location, for shells whose PATH does not include it.
+CARGO ?= $(or $(shell command -v cargo 2>/dev/null),$(HOME)/.cargo/bin/cargo)
 BIN := target/release/llm-usage
 DEBUG_BIN := target/debug/llm-usage
 OUT ?= target/preview
@@ -26,11 +28,11 @@ run: build stop
 
 ## build: compile the debug binary
 build:
-	@cargo build
+	@"$(CARGO)" build
 
 ## release: compile optimised and report the binary path
 release:
-	@cargo build --release
+	@"$(CARGO)" build --release
 	@echo "$(BIN)"
 
 ## stop: terminate a running instance (daemon and panel), if any
@@ -52,12 +54,12 @@ icon: build
 
 ## test: run the unit tests (no real credentials or provider requests)
 test:
-	@cargo test
+	@"$(CARGO)" test
 
 ## lint: formatting and clippy, warnings as errors
 lint:
-	@cargo fmt --check
-	@cargo clippy --all-targets -- -D warnings
+	@"$(CARGO)" fmt --check
+	@"$(CARGO)" clippy --all-targets -- -D warnings
 
 ## install: build optimised, install to PREFIX (~/.local), add a menu entry and autostart
 install: release
@@ -81,7 +83,7 @@ uninstall:
 
 ## clean: remove build products
 clean: stop
-	@cargo clean
+	@"$(CARGO)" clean
 
 ## help: list targets
 help:
