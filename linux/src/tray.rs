@@ -1,7 +1,8 @@
 //! The system tray item: a StatusNotifierItem on the session bus, which KDE,
 //! XFCE, Cinnamon, and GNOME with the AppIndicator extension (Ubuntu's default)
-//! all host. Left click toggles the panel; the context menu repeats the panel's
-//! two actions so the item is usable without opening it.
+//! all host. Where a click sends `Activate` (KDE, XFCE) it toggles the panel;
+//! Ubuntu's GNOME extension opens the menu on a click instead, so the menu
+//! carries the panel's content too (`menu.rs`).
 
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
@@ -11,6 +12,8 @@ use ksni::{Icon, MenuItem, ToolTip};
 
 use crate::daemon::Event;
 use crate::icon::{self, TrayArt};
+use crate::menu::{self, Line};
+use crate::menu_icon;
 
 pub enum TrayEvent {
     /// Left click: open the panel, or close it if it is open.
@@ -23,6 +26,7 @@ pub enum TrayEvent {
 pub struct Tray {
     pub art: TrayArt,
     pub summary: String,
+    pub lines: Vec<Line>,
     pub events: Mutex<Sender<Event>>,
 }
 
@@ -71,12 +75,23 @@ impl ksni::Tray for Tray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        vec![
-            MenuItem::Standard(StandardItem {
-                label: self.summary.clone(),
-                enabled: false,
-                ..Default::default()
-            }),
+        let mut items: Vec<MenuItem<Self>> = self
+            .lines
+            .iter()
+            .map(|line| match line {
+                // Enabled rather than greyed out: disabled items are drawn at
+                // reduced contrast, and these rows are the content. Clicking one
+                // opens the panel for the full view.
+                Line::Text(text, icon) => MenuItem::Standard(StandardItem {
+                    label: menu::escape(text),
+                    icon_data: icon.as_ref().map(menu_icon::render).unwrap_or_default(),
+                    activate: Box::new(|tray: &mut Self| tray.send(TrayEvent::Show)),
+                    ..Default::default()
+                }),
+                Line::Separator => MenuItem::Separator,
+            })
+            .collect();
+        items.extend([
             MenuItem::Separator,
             MenuItem::Standard(StandardItem {
                 label: "Open Panel".into(),
@@ -94,6 +109,7 @@ impl ksni::Tray for Tray {
                 activate: Box::new(|tray: &mut Self| tray.send(TrayEvent::Quit)),
                 ..Default::default()
             }),
-        ]
+        ]);
+        items
     }
 }

@@ -11,6 +11,8 @@ mod daemon;
 mod demo;
 mod icon;
 mod ipc;
+mod menu;
+mod menu_icon;
 mod model;
 mod panel;
 mod probe;

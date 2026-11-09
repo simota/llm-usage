@@ -141,6 +141,14 @@ What differs from macOS, and why:
   stores its login on Linux, in the same shape as the macOS keychain item. The
   file is only read, and the token is never refreshed, for the same reason as
   on macOS.
+- **A single click shows the usage in the tray menu.** Ubuntu's AppIndicator
+  extension opens an item's menu on a single click and activates it only on a
+  double click, so the menu carries the panel's content as text: the summary,
+  every source's rows, and the over-pace lines. A menu label takes no colour,
+  so each row's icon carries it: a usage ring in the severity hue with the pace
+  tick, and the card marks.
+  Clicking a row, or Open Panel, opens the full panel. A host that sends
+  `Activate` on a click opens the panel directly instead.
 - **The tray icon is square and single-colour.** Tray hosts draw icons square,
   so the three bars and the hot-figure mode are laid out in a square. There is
   no template rendering, so the artwork is light for the usual dark panel;
