@@ -16,3 +16,18 @@ jobs:
       - run: swift test
       - run: swift build -c release
       - run: ruby -c Formula/llm-usage.rb
+
+  linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: linux
+    steps:
+      - uses: actions/checkout@v4
+      # gpui links xcb and xkbcommon; the rest of its stack is loaded at runtime.
+      - run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
