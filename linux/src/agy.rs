@@ -125,10 +125,13 @@ impl UsageProvider for AgyProvider {
 fn run(deps: Arc<Deps>, session: Session<()>) {
     let mut last_good: Option<UsageSource> = None;
     let mut next_poll = Instant::now() + POLL_INTERVAL;
+    // Refreshes that arrived during the fetch are answered by it, so they are
+    // dropped — before publishing, not after: one sent in response to this
+    // update is a new request and must not be swallowed.
     let fetch = |last_good: &mut Option<UsageSource>| {
         let emitter = session.emitter.clone();
         let result = read_usage(&deps, &|| !emitter.is_alive());
-        if !emitter.is_alive() {
+        if !session.drain_refreshes(|()| {}) {
             return;
         }
         match result {
@@ -140,10 +143,10 @@ fn run(deps: Arc<Deps>, session: Session<()>) {
         }
     };
     fetch(&mut last_good);
-    if !session.drain_refreshes(|()| {}) {
-        return;
-    }
     loop {
+        if !session.emitter.is_alive() {
+            return;
+        }
         match session
             .rx
             .recv_timeout(next_poll.saturating_duration_since(Instant::now()))
@@ -154,9 +157,6 @@ fn run(deps: Arc<Deps>, session: Session<()>) {
             Err(RecvTimeoutError::Timeout) => next_poll = Instant::now() + POLL_INTERVAL,
         }
         fetch(&mut last_good);
-        if !session.drain_refreshes(|()| {}) {
-            return;
-        }
     }
 }
 
@@ -470,6 +470,44 @@ mod tests {
             next(&rx).note.as_deref(),
             Some("Unexpected Antigravity response (update agy)")
         );
+        provider.stop();
+    }
+
+    #[test]
+    fn refresh_sent_in_response_to_an_update_is_not_swallowed() {
+        // The callback holds the worker until the test has asked for a
+        // refresh, which is exactly when the old code drained it away.
+        let (updates_tx, updates) = channel::<UsageSource>();
+        let (gate_tx, gate) = channel::<()>();
+        let (updates_tx, gate) = (Mutex::new(updates_tx), Mutex::new(gate));
+        let deps = Deps {
+            resolve: Arc::new(|| {
+                Some(Resolution {
+                    path: "/fixture/agy".into(),
+                    environment: Default::default(),
+                })
+            }),
+            run: Arc::new(|_, args, _, _, _| {
+                Ok(if args == ["--version"] {
+                    "1.2.5".into()
+                } else {
+                    QUOTA.into()
+                })
+            }),
+        };
+        let provider = Arc::new(AgyProvider::new(
+            deps,
+            Arc::new(move |r| {
+                let _ = updates_tx.lock().unwrap().send(r.unwrap());
+                let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(3));
+            }),
+        ));
+        provider.start();
+        next(&updates);
+        provider.refresh();
+        gate_tx.send(()).unwrap();
+        next(&updates);
+        gate_tx.send(()).unwrap();
         provider.stop();
     }
 

@@ -469,6 +469,9 @@ impl Worker {
         let mut next_poll = std::time::Instant::now() + Duration::from_secs_f64(POLL_INTERVAL);
         self.attempt_fetch();
         loop {
+            if !self.emitter().is_alive() {
+                return;
+            }
             let instant_now = std::time::Instant::now();
             let mut wait = next_poll.saturating_duration_since(instant_now);
             if let Some(retry_at) = self.retry_at {
@@ -476,12 +479,7 @@ impl Worker {
                 wait = wait.min(until);
             }
             match self.session.rx.recv_timeout(wait) {
-                Ok(Msg::Refresh) => {
-                    self.attempt_fetch();
-                    if !self.session.drain_refreshes(|()| {}) {
-                        return;
-                    }
-                }
+                Ok(Msg::Refresh) => self.attempt_fetch(),
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                 Ok(Msg::Event(())) => {}
                 Err(RecvTimeoutError::Timeout) => {
@@ -616,7 +614,7 @@ impl Worker {
         self.retry_attempt = 0;
         self.next_allowed_fetch_at = None;
         self.retry_at = None;
-        self.emitter().source(source);
+        self.publish(source);
     }
 
     fn handle_failure(&mut self, status: u16, retry_after_header: Option<&str>) {
@@ -635,6 +633,15 @@ impl Worker {
         self.emit_unavailable(&reason);
     }
 
+    /// Refreshes that arrived while this cycle ran were answered by it, so they
+    /// are dropped — before publishing, not after: one sent in response to
+    /// this update is a new request and must not be swallowed.
+    fn publish(&self, source: UsageSource) {
+        if self.session.drain_refreshes(|()| {}) {
+            self.emitter().source(source);
+        }
+    }
+
     /// Keeps the last confirmed reading visible as stale when a new fetch fails.
     fn emit_unavailable(&self, reason: &str) {
         if let Some(mut previous) = self.last_good.clone() {
@@ -643,13 +650,13 @@ impl Worker {
                 Some(since) => SourceState::Stale { since },
                 None => SourceState::Error(reason.to_string()),
             };
-            self.emitter().source(previous);
+            self.publish(previous);
         } else {
             let mut placeholder = UsageSource::placeholder("claude", "Claude Code");
             placeholder.plan = self.identity.plan();
             placeholder.account = self.identity.account();
             placeholder.note = Some(reason.to_string());
-            self.emitter().source(placeholder);
+            self.publish(placeholder);
         }
     }
 }
