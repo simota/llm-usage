@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LLM Usage
+Comment=Claude Code, Codex and Antigravity usage limits in the system tray
+Exec=@BIN@
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;Monitor;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

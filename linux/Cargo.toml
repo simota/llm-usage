@@ -1,0 +1,30 @@
+[package]
+name = "llm-usage"
+version = "0.2.6"
+edition = "2024"
+rust-version = "1.88"
+description = "LLM Usage for Linux: Claude Code, Codex and Antigravity usage limits in the system tray, built with gpui"
+publish = false
+
+[[bin]]
+name = "llm-usage"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+gpui = "0.2.2"
+jiff = { version = "0.2", features = ["serde"] }
+# The tray is a StatusNotifierItem on D-Bus, served from ksni's own thread.
+# async-io rather than ksni's default tokio: gpui already brings an executor,
+# and a whole second runtime only for the tray would be dead weight.
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+libc = "0.2"
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
